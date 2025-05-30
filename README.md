@@ -182,6 +182,34 @@ YubiKey ← Yggdrasil Network → IPFS/BitTorrent (large files)
 - IPFS for distributed storage
 - BitTorrent for large file sharing
 
+## Security Considerations
+
+### Alpha Software Warning
+**Brunnen-G is alpha software under active development. Use at your own risk. Not recommended for production systems.**
+
+### Blockchain Visibility
+- All Emercoin transactions and domain records are publicly visible
+- Domain ownership and update history can be tracked
+- Private key loss results in permanent domain loss
+
+### Network Dependencies  
+- Yggdrasil connectivity depends on peer availability
+- Traffic is visible to mesh peer nodes
+- IPv6 addresses may reveal location information
+
+### Legal & Jurisdictional Risks
+- Cryptocurrency usage may be restricted in some jurisdictions
+- Decentralized DNS may conflict with local regulations
+- Users responsible for compliance with applicable laws
+
+### Operational Security
+- Regular backup of TPM metadata and Emercoin keys required
+- Domain registration requires EMC cryptocurrency
+- Monitor domain expiration to prevent loss
+- Consider VPN usage over Yggdrasil for additional privacy
+
+**Recommendation**: Evaluate these risks against your threat model before deployment.
+
 ## License
 
 AGPL-3.0 License
