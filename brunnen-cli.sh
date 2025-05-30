@@ -1,5 +1,20 @@
 #!/bin/bash
 
+HACKER_MODE=0
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --hacker-mode)
+            HACKER_MODE=1
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--hacker-mode]"
+            exit 1
+            ;;
+    esac
+done
+
 # DGA database naming
 generate_db_name() {
     local seed=$(hostname)$(whoami)
@@ -238,12 +253,10 @@ publish_to_emercoin() {
     updated_json=$(echo "$existing_json" | jq \
         --arg cid "$cid" \
         --arg merkle "$merkle_root" \
-        --arg ygg "$ygg_addr" \
         '. + {
-            "brunnen_g": {
+            "trust": {
                 "cid": $cid,
-                "merkle_root": $merkle,
-                "yggdrasil": $ygg
+                "merkle_root": $merkle
             }
         }')
     
@@ -381,7 +394,7 @@ verify_yubikey_identity() {
 
 query_user() {
     echo "=== Query User ==="
-    echo -n "Enter user@domain.coin: "
+    echo -n "Enter user@domain.(coin, emc, lib, bazar): "
     read user_address
     
     result=$(sqlite3 "$DB_NAME" "SELECT pubkey FROM address_keys WHERE address = '$user_address';" 2>/dev/null)
@@ -397,7 +410,7 @@ query_user() {
 
 verify_identity() {
     echo "=== Verify Identity ==="
-    echo -n "Enter user@domain.coin: "
+    echo -n "Enter {user}@domain.(coin, emc, lib, bazar): "
     read user_address
     
     result=$(sqlite3 "$DB_NAME" "SELECT address, pubkey, TPM_enable FROM address_keys WHERE address = '$user_address';" 2>/dev/null)
@@ -414,7 +427,7 @@ verify_identity() {
 
 sign_data() {
     echo "=== Sign Data (TPM) ==="
-    echo -n "Your identity (user@domain.coin): "
+    echo -n "Your identity {user}@domain.(coin, emc, lib, bazar): "
     read signer
     echo -n "Data to sign: "
     read data
@@ -440,7 +453,7 @@ sign_data() {
 
 verify_signature() {
     echo "=== Verify TPM Signature ==="
-    echo -n "Signer (user@domain.coin): "
+    echo -n "Signer {user}@domain.(coin, emc, lib, bazar): "
     read signer
     echo -n "Original data: "
     read data
@@ -722,11 +735,11 @@ sync_with_peers() {
     done
 }
 validate_address() {
-    [[ "$1" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.coin$ ]]
+    [[ "$1" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.(coin|emc|lib|bazar)$ ]]
 }
 
 validate_domain() {
-    [[ "$1" =~ ^[a-zA-Z0-9.-]+\.coin$ ]]
+    [[ "$1" =~ ^[a-zA-Z0-9.-]+\.(coin|emc|lib|bazar)$ ]]
 }
 
 manage_api_keys() {
@@ -756,6 +769,151 @@ manage_api_keys() {
     esac
 }
 
+check_expiry() {
+    # Domain DNS record
+    local domain_expires=$(emercoin-cli name_show "dns:$domain" 2>/dev/null | jq -r '.expires_in // 0')
+    
+    # Trust database
+    local trust_expires=$(emercoin-cli name_show "trust:$domain" 2>/dev/null | jq -r '.expires_in // 0')
+    
+    if [[ $domain_expires -lt 30 ]]; then
+        echo -e "\033[33m[Warning]\033[0m Domain expires in $domain_expires days!"
+    fi
+    
+    if [[ $trust_expires -lt 30 ]]; then
+        echo -e "\033[33m[Warning]\033[0m Trust database expires in $trust_expires days!"
+    fi
+}
+
+publish_risk_data() {
+    local risk_id="$1"
+    local data="$2"
+    local domain="${3:-$(whoami).coin}"
+    
+    if ! verify_domain_ownership "$domain"; then
+        echo "Domain ownership verification failed"
+        return 1
+    fi
+    
+    # Encode data with CBOR
+    cbor_data=$(echo "$data" | python3 -c "import cbor2, sys, json; print(cbor2.dumps(json.loads(sys.stdin.read())).hex())")
+    
+    echo "Publishing risk data: risk:$risk_id"
+    
+    # Publish to blockchain
+    emercoin-cli -rpcwallet="$selected_wallet" name_new "risk:$risk_id" "$cbor_data" 365
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "\033[32m[Success]\033[0m Risk data published: risk:$risk_id"
+    else
+        echo -e "\033[31m[Failure]\033[0m Risk data publishing failed"
+        return 1
+    fi
+}
+
+enable_wazuh_monitoring() {
+    echo "Enabling Wazuh monitoring..."
+    
+    # Check if Wazuh is installed
+    if [[ ! -S "/var/ossec/queue/ossec/queue" ]]; then
+        echo "[ERROR] Wazuh not installed or not running"
+        echo "Install Wazuh agent first: https://documentation.wazuh.com/current/installation-guide/"
+        return 1
+    fi
+    
+    # Enable monitoring
+    python3 wazuh_monitor.py enable
+    
+    if [[ $? -eq 0 ]]; then
+        echo "[SUCCESS] Wazuh monitoring enabled"
+        echo "Events will be logged to Wazuh SIEM"
+    else
+        echo "[ERROR] Failed to enable monitoring"
+    fi
+}
+
+disable_wazuh_monitoring() {
+    echo "Disabling Wazuh monitoring..."
+    python3 wazuh_monitor.py disable
+    
+    if [[ $? -eq 0 ]]; then
+        echo "[SUCCESS] Wazuh monitoring disabled"
+    else
+        echo "[ERROR] Failed to disable monitoring"
+    fi
+}
+
+check_wazuh_status() {
+    echo "Checking Wazuh monitoring status..."
+    
+    # Check if Wazuh agent is running
+    if systemctl is-active --quiet wazuh-agent; then
+        echo "[OK] Wazuh agent is running"
+    else
+        echo "[WARNING] Wazuh agent not running"
+    fi
+    
+    # Check if monitoring is enabled
+    python3 wazuh_monitor.py status
+    
+    # Check socket availability
+    if [[ -S "/var/ossec/queue/ossec/queue" ]]; then
+        echo "[OK] Wazuh socket available"
+    else
+        echo "[ERROR] Wazuh socket not found"
+    fi
+}
+
+test_wazuh_connection() {
+    echo "Testing Wazuh connection..."
+    python3 wazuh_monitor.py test
+    
+    if [[ $? -eq 0 ]]; then
+        echo "[SUCCESS] Test event sent to Wazuh"
+        echo "Check Wazuh dashboard for 'brunnen-g' events"
+    else
+        echo "[ERROR] Failed to send test event"
+    fi
+}
+encrypt_metadata() {
+    if [[ ! -f "/tpmdata/provisioning.json" ]]; then
+        echo "No metadata to encrypt"
+        return 1
+    fi
+    
+    challenge=$(openssl rand 32 | xxd -p -c 32)
+    aes_key=$(ykchalresp -2 -x "$challenge")
+    
+    openssl enc -aes-256-cbc -in /tpmdata/provisioning.json \
+        -out /tpmdata/provisioning.enc -k "$aes_key"
+    
+    echo "$challenge" > /tpmdata/.challenge
+    chmod 600 /tpmdata/provisioning.enc /tpmdata/.challenge
+    rm /tpmdata/provisioning.json
+    echo "Metadata encrypted with YubiKey"
+}
+
+decrypt_metadata() {
+    if [[ ! -f "/tpmdata/provisioning.enc" ]]; then
+        echo "No encrypted metadata found"
+        return 1
+    fi
+    
+    # Ensure tpmdata directory exists and is writable
+    if [[ ! -w "/tpmdata" ]]; then
+        echo "Cannot write to /tpmdata directory"
+        return 1
+    fi
+    
+    challenge=$(cat /tpmdata/.challenge)
+    aes_key=$(ykchalresp -2 -x "$challenge")
+    
+    openssl enc -aes-256-cbc -d -in /tpmdata/provisioning.enc \
+        -out /tpmdata/provisioning.json -k "$aes_key"
+    echo "Metadata decrypted"
+}
+
+echo -e "\033[32m"
 echo "
 ██████╗ ██████╗ ██╗   ██╗███╗   ██╗███╗   ██╗███████╗███╗   ██╗       ██████╗ 
 ██╔══██╗██╔══██╗██║   ██║████╗  ██║████╗  ██║██╔════╝████╗  ██║      ██╔════╝ 
@@ -763,16 +921,26 @@ echo "
 ██╔══██╗██╔══██╗██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║╚██╗██║╚════╝██║   ██║
 ██████╔╝██║  ██║╚██████╔╝██║ ╚████║██║ ╚████║███████╗██║ ╚████║      ╚██████╔╝
 ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═══╝       ╚═════╝ 
-                        Decentralized PKI Infrastructure
+                        Decentralized Public Key Infrastructure
 "
+echo -e "\033[36mcybersec.mesh_authenticated\033[0m"
 
 while true; do
-    echo "=== Brunnen-G ==="
-    echo "1) Quick Setup (Register + Start Services)"
-    echo "2) Identity Operations"
-    echo "3) Network & Communication"
-    echo "4) Advanced Settings"
-    echo "5) Exit"
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [SYSTEM_ACCESS] ===\033[0m"
+        echo -e "\033[32m1) init\033[0m.\033[37midentity_bootstrap\033[0m"
+        echo -e "\033[32m2) query\033[0m.\033[37muser_database\033[0m" 
+        echo -e "\033[32m3) mesh\033[0m.\033[37mnetwork_ops\033[0m"
+        echo -e "\033[32m4) admin\033[0m.\033[37mroot_access\033[0m"
+        echo -e "\033[32m5) logout\033[0m.\033[37msecure\033[0m"
+    else
+        echo "=== Brunnen-G ==="
+        echo "1) Quick Setup (Register + Start Services)"
+        echo "2) Identity Operations"
+        echo "3) Network & Communication"
+        echo "4) Advanced Settings"
+        echo "5) Exit"
+    fi
     echo -n "Choice: "
     
     read choice
@@ -794,12 +962,17 @@ quick_setup() {
 }
 
 identity_menu() {
-    echo "=== Identity ==="
-    echo "1) Query user"
-    echo "2) Sign message"
-    echo "3) Verify signature"
-    echo -n "Choice: "
-    read choice
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [IDENTITY_CORE] ===\033[0m"
+        echo -e "\033[32m1) query\033[0m.\033[37muser_lookup\033[0m"
+        echo -e "\033[32m2) crypto\033[0m.\033[37msign_message\033[0m"
+        echo -e "\033[32m3) verify\033[0m.\033[37msignature_check\033[0m"
+    else
+        echo "=== Identity ==="
+        echo "1) Query user"
+        echo "2) Sign message"  
+        echo "3) Verify signature"
+    fi
     
     case $choice in
         1) query_user ;;
@@ -809,11 +982,17 @@ identity_menu() {
 }
 
 network_menu() {
-    echo "=== Network ==="
-    echo "1) Publish to blockchain (requires domain ownership)"
-    echo "2) Configure VoIP"
-    echo "3) Send message (coming soon)"
-    echo -n "Choice: "
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [MESH_PROTOCOL] ===\033[0m"
+        echo -e "\033[32m1) blockchain\033[0m.\033[37mpublish_data\033[0m"
+        echo -e "\033[32m2) voip\033[0m.\033[37mconfigure_node\033[0m"
+        echo -e "\033[32m3) messaging\033[0m.\033[37msend_encrypted\033[0m"
+    else
+        echo "=== Network ==="
+        echo "1) Publish to blockchain (requires domain ownership)"
+        echo "2) Configure VoIP"
+        echo "3) Send message (coming soon)"
+        echo -n "Choice: "
     read choice
     
     case $choice in
@@ -829,5 +1008,108 @@ network_menu() {
             ;;
         2) configure_voip ;;
         3) echo "Messaging not yet implemented" ;;
+    esac
+}
+
+advanced_menu() {
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [ROOT_ACCESS] ===\033[0m"
+        echo -e "\033[32m1) api\033[0m.\033[37mkey_management\033[0m"
+        echo -e "\033[32m2) database\033[0m.\033[37moperations\033[0m"
+        echo -e "\033[32m3) tmp\033[0m.\033[37mmaintenance\033[0m"
+        echo -e "\033[32m4) wazuh\033[0m.\033[37mmonitoring\033[0m"
+    else
+        echo "=== Advanced Settings ==="
+        echo "1) Manage API keys"
+        echo "2) Database operations"
+        echo "3) TPM maintenance"
+        echo "4) Wazuh monitoring"
+
+    fi
+    echo -n "Choice: "
+    
+    read choice
+    case $choice in
+        1) manage_api_keys ;;
+        2) database_operations ;;
+        3) tmp_maintenance ;;
+        4) wazuh_menu ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+wazuh_menu() {
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [MONITORING_CORE] ===\033[0m"
+        echo -e "\033[32m1) wazuh\033[0m.\033[37menable\033[0m"
+        echo -e "\033[32m2) wazuh\033[0m.\033[37mdisable\033[0m" 
+        echo -e "\033[32m3) wazuh\033[0m.\033[37mstatus\033[0m"
+        echo -e "\033[32m4) wazuh\033[0m.\033[37mtest\033[0m"
+    else
+        echo "=== Wazuh Monitoring ==="
+        echo "1) Enable monitoring"
+        echo "2) Disable monitoring"
+        echo "3) Check status"
+        echo "4) Test connection"
+    fi
+    echo -n "Choice: "
+    
+    read choice
+    case $choice in
+        1) enable_wazuh_monitoring ;;
+        2) disable_wazuh_monitoring ;;
+        3) check_wazuh_status ;;
+        4) test_wazuh_connection ;;
+        *) echo "Invalid choice" ;;
+    esac
+}
+
+database_operations() {
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [DATABASE_CORE] ===\033[0m"
+        echo -e "\033[32m1) export\033[0m.\033[37mbackup_file\033[0m"
+        echo -e "\033[32m2) ipfs\033[0m.\033[37mpublish_db\033[0m"
+        echo -e "\033[32m3) merkle\033[0m.\033[37mview_roots\033[0m"
+        echo -e "\033[32m4) verify\033[0m.\033[37mintegrity\033[0m"
+    else
+        echo "=== Database Operations ==="
+        echo "1) Export database"
+        echo "2) Backup to IPFS"
+        echo "3) View merkle roots"
+        echo "4) Check integrity"
+    fi
+    echo -n "Choice: "
+    read choice
+    
+    case $choice in
+        1) cp "$DB_NAME" "/tmp/backup_$(date +%s).db"; echo "Exported" ;;
+        2) publish_database_ipfs ;;
+        3) sqlite3 "$DB_NAME" "SELECT * FROM db_root;" ;;
+        4) update_all_merkle_roots ;;
+    esac
+}
+
+tmp_maintenance() {
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [TPM_SECURE] ===\033[0m"
+        echo -e "\033[32m1) tpm\033[0m.\033[37mview_handles\033[0m"
+        echo -e "\033[32m2) crypto\033[0m.\033[37mencrypt_metadata\033[0m"
+        echo -e "\033[32m3) crypto\033[0m.\033[37mdecrypt_metadata\033[0m"
+        echo -e "\033[32m4) keygen\033[0m.\033[37mdomain_key\033[0m"
+    else
+        echo "=== TPM Maintenance ==="
+        echo "1) View TPM handles"
+        echo "2) Encrypt metadata (YubiKey)"
+        echo "3) Decrypt metadata (YubiKey)"
+        echo "4) Generate domain key"
+    fi
+    echo -n "Choice: "
+    read choice
+    
+    case $choice in
+        1) tmp2_getcap handles-persistent ;;
+        2) encrypt_metadata ;;
+        3) decrypt_metadata ;;
+        4) run_tpm_script ../tpm/tpm_provisioning.sh ;;
     esac
 }
