@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Brunnen-G PKI in Agregore</title>
+    <style>
+        body { font-family: monospace; max-width: 800px; margin: 20px auto; }
+        .result { background: #f0f0f0; padding: 10px; margin: 10px 0; }
+        input, button { padding: 8px; margin: 5px; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Brunnen-G PKI Interface</h1>
+    
+    <h2>Register Identity</h2>
+    <div>
+        <input id="username" placeholder="Username" />
+        <input id="domain" placeholder="domain.coin" />
+        <button onclick="registerUser()">Register</button>
+    </div>
+    
+    <h2>Query User</h2>
+    <div>
+        <input id="queryAddress" placeholder="user@domain.coin" />
+        <button onclick="queryUser()">Query</button>
+    </div>
+    
+    <h2>Verify Identity</h2>
+    <div>
+        <input id="verifyAddress" placeholder="user@domain.coin" />
+        <button onclick="verifyUser()">Verify</button>
+    </div>
+    
+    <div id="results" class="result"></div>
+
+    <script>
+        const API_BASE = 'http://localhost:8080/api';
+        let hmacKey = null;
+
+        // Get HMAC key hash for verification
+        async function getKeyHash() {
+            try {
+                const response = await fetch(`${API_BASE}/key`);
+                const data = await response.json();
+                return data.key_hash;
+            } catch (error) {
+                showResult('Failed to get API key', 'error');
+                return null;
+            }
+        }
+
+        // Generate HMAC for request (simplified - in production, use server-side key)
+        async function generateHMAC(payload, key) {
+            const encoder = new TextEncoder();
+            const keyData = encoder.encode(key);
+            const messageData = encoder.encode(payload);
+            
+            const cryptoKey = await crypto.subtle.importKey(
+                'raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+            );
+            
+            const signature = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
+            return Array.from(new Uint8Array(signature))
+                .map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        async function registerUser() {
+            const username = document.getElementById('username').value;
+            const domain = document.getElementById('domain').value;
+            
+            if (!username || !domain) {
+                showResult('Please fill in username and domain', 'error');
+                return;
+            }
+
+            // Generate keypair in browser
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'Ed25519' }, true, ['sign', 'verify']
+            );
+            
+            const publicKey = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+            const pubkeyHex = Array.from(new Uint8Array(publicKey))
+                .map(b => b.toString(16).padStart(2, '0')).join('');
+
+            const payload = JSON.stringify({
+                username: username,
+                domain: domain,
+                pubkey: pubkeyHex
+            });
+
+            try {
+                const response = await fetch(`${API_BASE}/register`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        // Note: In production, HMAC key should be securely managed
+                    },
+                    body: payload
+                });
+
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    showResult(`Registered: ${result.address}`, 'success');
+                    
+                    // Store private key in Agregore's local storage for this domain
+                    const privateKey = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+                    localStorage.setItem(`privateKey_${result.address}`, 
+                        Array.from(new Uint8Array(privateKey))
+                            .map(b => b.toString(16).padStart(2, '0')).join(''));
+                } else {
+                    showResult(`Error: ${result.message}`, 'error');
+                }
+            } catch (error) {
+                showResult(`Network error: ${error.message}`, 'error');
+            }
+        }
+
+        async function queryUser() {
+            const address = document.getElementById('queryAddress').value;
+            if (!address) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/query?address=${encodeURIComponent(address)}`);
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    showResult(`Found user: ${result.address}\nPublic Key: ${result.pubkey}`, 'success');
+                } else {
+                    showResult(`User not found: ${address}`, 'error');
+                }
+            } catch (error) {
+                showResult(`Network error: ${error.message}`, 'error');
+            }
+        }
+
+        async function verifyUser() {
+            const address = document.getElementById('verifyAddress').value;
+            if (!address) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/verify?address=${encodeURIComponent(address)}`);
+                const result = await response.json();
+                
+                if (result.verified) {
+                    showResult(`✓ Verified: ${result.address}`, 'success');
+                } else {
+                    showResult(`✗ Not verified: ${address}`, 'error');
+                }
+            } catch (error) {
+                showResult(`Network error: ${error.message}`, 'error');
+            }
+        }
+
+        function showResult(message, type) {
+            const results = document.getElementById('results');
+            results.className = `result ${type}`;
+            results.textContent = message;
+        }
+
+        // Initialize
+        window.onload = () => {
+            getKeyHash().then(hash => {
+                if (hash) {
+                    showResult(`Connected to Brunnen-G API (Key: ${hash.substring(0, 16)}...)`, 'success');
+                }
+            });
+        };
+    </script>
+</body>
+</html>
