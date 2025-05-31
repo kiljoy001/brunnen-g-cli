@@ -66,7 +66,7 @@ emercoind -daemon
 # Set your DNS to: 185.121.177.177, 169.239.202.202
 
 # Option 2: Local DNS proxy (advanced)
-# Configure dnsmasq to forward .coin domains to localhost:5335
+# Configure dnsmasq to forward emercoin tld (top level domains) to localhost:5335
 ```
 
 **Full setup guide**: https://emercoin.com/en/documentation/blockchain-services/emerdns/emerdns-introduction/
