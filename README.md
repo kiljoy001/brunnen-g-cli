@@ -176,16 +176,17 @@ YubiKey ← Yggdrasil Network → IPFS/BitTorrent (large files)
 - Linux OS with tpm2-tools
 - Python 3.8+
 - Go 1.19+
+- IPFS
+- Bittorrent
 
 **Recommended:**
 - YubiKey for enhanced security
-- IPFS for distributed storage
-- BitTorrent for large file sharing
+
 
 ## Security Considerations
 
 ### Alpha Software Warning
-**Brunnen-G is alpha software under active development. Use at your own risk. Not recommended for production systems.**
+**Brunnen-G is alpha software under active development. Use at your own risk. Not recommended for production systems at this time.**
 
 ### Blockchain Visibility
 - All Emercoin transactions and domain records are publicly visible
