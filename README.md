@@ -132,13 +132,6 @@ curl http://localhost:8080/api/v1/query?address=alice@example.coin
 3. Start daemon: `emercoind -daemon`
 4. Verify: `emercoin-cli getinfo`
 
-### Environment Variables
-```bash
-export BRUNNEN_DB_DIR="/var/lib/brunnen"
-export API_PORT="8080"
-export TPM_DEVICE="/dev/tpm0"
-```
-
 ## File Structure
 
 ```
