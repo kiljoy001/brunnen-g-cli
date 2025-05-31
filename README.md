@@ -50,8 +50,6 @@ daemon=1
 
 # Enable DNS services
 emcdns=1
-emcdnsallowed=.coin|.emc|.lib|.bazar
-emcdnsverbose=4
 ```
 
 2. **Start Emercoin daemon**
