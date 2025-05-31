@@ -62,11 +62,15 @@ emercoind -daemon
 
 3. **Configure DNS resolution**
 ```bash
-# Option 1: Use OpenNIC DNS servers (easiest)
+# Configure DNS resolution
+# Option 1: If you have local Emercoin DNS server (recommended, review the full setup guide)
+# Configure your network/router to use your Emercoin node for DNS
+
+# Option 2: Use OpenNIC DNS servers  
 # Set your DNS to: 185.121.177.177, 169.239.202.202
 
-# Option 2: Local DNS proxy (advanced)
-# Configure dnsmasq to forward emercoin tld (top level domains) to localhost:5335
+# Option 3: Local DNS proxy (advanced)
+# Configure dnsmasq to forward emercoin top level domains to localhost:5335
 ```
 
 **Full setup guide**: https://emercoin.com/en/documentation/blockchain-services/emerdns/emerdns-introduction/
