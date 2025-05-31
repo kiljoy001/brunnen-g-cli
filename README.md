@@ -50,8 +50,6 @@ daemon=1
 
 # Enable DNS services
 emcdns=1
-emcdnsallowed=.coin|.emc|.lib|.bazar
-emcdnsverbose=4
 ```
 
 2. **Start Emercoin daemon**
@@ -62,11 +60,15 @@ emercoind -daemon
 
 3. **Configure DNS resolution**
 ```bash
-# Option 1: Use OpenNIC DNS servers (easiest)
+# Configure DNS resolution
+# Option 1: If you have local Emercoin DNS server (recommended, review the full setup guide)
+# Configure your network/router to use your Emercoin node for DNS
+
+# Option 2: Use OpenNIC DNS servers  
 # Set your DNS to: 185.121.177.177, 169.239.202.202
 
-# Option 2: Local DNS proxy (advanced)
-# Configure dnsmasq to forward .coin domains to localhost:5335
+# Option 3: Local DNS proxy (advanced)
+# Configure dnsmasq to forward emercoin top level domains to localhost:5335
 ```
 
 **Full setup guide**: https://emercoin.com/en/documentation/blockchain-services/emerdns/emerdns-introduction/
@@ -132,13 +134,6 @@ curl http://localhost:8080/api/v1/query?address=alice@example.coin
 3. Start daemon: `emercoind -daemon`
 4. Verify: `emercoin-cli getinfo`
 
-### Environment Variables
-```bash
-export BRUNNEN_DB_DIR="/var/lib/brunnen"
-export API_PORT="8080"
-export TPM_DEVICE="/dev/tpm0"
-```
-
 ## File Structure
 
 ```
@@ -176,16 +171,17 @@ YubiKey ← Yggdrasil Network → IPFS/BitTorrent (large files)
 - Linux OS with tpm2-tools
 - Python 3.8+
 - Go 1.19+
+- IPFS
+- Bittorrent
 
 **Recommended:**
 - YubiKey for enhanced security
-- IPFS for distributed storage
-- BitTorrent for large file sharing
+
 
 ## Security Considerations
 
 ### Alpha Software Warning
-**Brunnen-G is alpha software under active development. Use at your own risk. Not recommended for production systems.**
+**Brunnen-G is alpha software under active development. Use at your own risk. Not recommended for production systems at this time.**
 
 ### Blockchain Visibility
 - All Emercoin transactions and domain records are publicly visible
