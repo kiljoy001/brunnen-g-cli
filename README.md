@@ -4,22 +4,37 @@
 
 Brunnen-G provides secure identity management through TPM-secured keys, blockchain persistence via Emercoin, and distributed networking with Yggdrasil.
 
+## Development Status
+
+**Phase 1 (~60% Complete)**: Core infrastructure and identity management
+- ✅ TPM integration, database schema, domain verification
+- ⚠️ Identity registration (fixing variable mismatches)
+- ❌ PAM module, data layer, enterprise features
+
 ## Core Features
 
-- **TPM 2.0 Integration**: Hardware-secured private key storage
-- **Emercoin Blockchain**: Persistent identity and domain ownership verification  
-- **Yggdrasil Networking**: Mesh networking for global connectivity
+### Current
+- **TPM 2.0 Integration**: Hardware-secured private key storage with randomized handles
+- **Emercoin Blockchain**: Domain ownership verification and trust records
+- **Yggdrasil Networking**: Mesh networking for global connectivity  
 - **SQLite Database**: Local identity caching with merkle tree verification
-- **REST API**: Programmatic access for integration
-- **Blockchain Storage**: "risk:" prefix for data, "trust:" for key DB with merkle proofs
-- **Domain-Based Authentication**: Blockchain ownership provides write authority
-- **YubiKey Support**: Hardware authentication tokens (recommended)
+- **REST API**: Programmatic access (read-only for security)
+- **YubiKey Support**: Hardware authentication tokens and metadata encryption
+
+### Planned (Phase 2)
+- **PAM Module**: Linux authentication integration  
+- **Group Registry**: Blockchain-stored group memberships with cross-machine sync
+- **Data Layer**: CBOR/IPFS/BitTorrent tiered storage with "risk:" prefix
+
+### Enterprise Features (Phase 3)
+- **Zero-Trust Authentication**: User + machine TPM verification required
+- **Wazuh SIEM**: Security monitoring and threat detection
 
 ## Requirements
 
 ### Hardware
 - TPM 2.0 chip (required)
-- YubiKey (optional)
+- YubiKey (required)
 
 ### Software Dependencies
 ```bash
@@ -31,7 +46,10 @@ sudo apt install tpm2-tools sqlite3 python3 golang-go git
 # Configure with RPC enabled
 
 # Python packages
-pip3 install sqlite3 requests cryptography cbor2
+pip3 install sqlite3 requests cryptography cbor2 systemd-python
+
+# Optional: Ollama for voice control
+curl -fsSL https://ollama.com/install.sh | sh
 ```
 
 ## Installation
@@ -47,8 +65,6 @@ rpcport=8775
 server=1
 listen=1
 daemon=1
-
-# Enable DNS services
 emcdns=1
 ```
 
@@ -60,25 +76,19 @@ emercoind -daemon
 
 3. **Configure DNS resolution**
 ```bash
-# Configure DNS resolution
-# Option 1: If you have local Emercoin DNS server (recommended, review the full setup guide)
-# Configure your network/router to use your Emercoin node for DNS
+# Option 1: Local Emercoin DNS (recommended)
+# Configure router/network to use your node for DNS
 
-# Option 2: Use OpenNIC DNS servers  
-# Set your DNS to: 185.121.177.177, 169.239.202.202
-
-# Option 3: Local DNS proxy (advanced)
-# Configure dnsmasq to forward emercoin top level domains to localhost:5335
+# Option 2: OpenNIC DNS servers  
+# Set DNS to: 185.121.177.177, 169.239.202.202
 ```
 
-**Full setup guide**: https://emercoin.com/en/documentation/blockchain-services/emerdns/emerdns-introduction/
-
-2. **Install Yggdrasil**
+4. **Install Yggdrasil**
 ```bash
 sudo ./install_yggdrasil.sh
 ```
 
-3. **Setup TPM**
+5. **Setup TPM**
 ```bash
 # Add user to tss group
 sudo usermod -a -G tss $USER
@@ -89,61 +99,34 @@ tpm2_startup -c
 tpm2_getcap properties-fixed
 ```
 
-4. **Initialize Brunnen-G**
+6. **Initialize Brunnen-G**
 ```bash
 ./brunnen-cli.sh
 # Choose option 1: Quick Setup
 ```
 
-## Basic Usage
+## Usage
 
 ### Command Line
 ```bash
 # Start CLI
 ./brunnen-cli.sh
 
-# Register identity (requires domain ownership in Emercoin)
-# Menu: 1 → Quick Setup
-
-# Query user
-# Menu: 2 → Identity Operations → 1
-
-# Sign data
-# Menu: 2 → Identity Operations → 2
+# Hacker mode (enhanced UI)
+./brunnen-cli.sh --hacker-mode
 ```
 
-### API
+### API (Read-Only)
 ```bash
 # Start API daemon
 python3 api_daemon.py
 
-# Register identity
-curl -X POST http://localhost:8080/api/v1/register \
-  -H "Content-Type: application/json" \
-  -d '{"username": "alice", "domain": "example.coin"}'
+# Query user (requires API key)
+curl -H "X-API-Key: your_key" \
+  http://localhost:8080/api/v1/query?address=alice@example.coin
 
-# Query user
-curl http://localhost:8080/api/v1/query?address=alice@example.coin
-```
-
-## Configuration
-
-### Emercoin Setup (REQUIRED)
-1. Download Emercoin from official website
-2. Configure RPC access in `~/.emercoin/emercoin.conf`
-3. Start daemon: `emercoind -daemon`
-4. Verify: `emercoin-cli getinfo`
-
-## File Structure
-
-```
-brunnen-g-cli/
-├── brunnen-cli.sh          # Main CLI interface
-├── api_daemon.py           # REST API server
-├── yggdrasil-tpm-startup.sh # TPM-secured Yggdrasil
-├── install_yggdrasil.sh    # Yggdrasil installation
-├── web/brunnen-g.html      # Web interface
-└── tpm/                    # TPM utilities
+# Health check (public)
+curl http://localhost:8080/api/v1/health
 ```
 
 ## Architecture
@@ -151,60 +134,78 @@ brunnen-g-cli/
 ```
 Applications → REST API → Identity Management
                     ↓
-TPM 2.0 ← SQLite ← Merkle Trees → Emercoin ("trust:" key DB, "risk:" data)
-    ↓                                  ↓
-YubiKey ← Yggdrasil Network → IPFS/BitTorrent (large files)
+TPM 2.0 ← SQLite ← Merkle Trees → Emercoin Blockchain
+    ↓              ↓                      ↓
+YubiKey ← Yggdrasil Network → IPFS → Group Registry
 ```
 
-## Security Notes
+## Blockchain Records
 
-- Private keys never leave TPM hardware
-- Emercoin blockchain provides tamper-proof domain ownership
-- All database operations use cryptographic verification
-- Network traffic encrypted via Yggdrasil mesh
+- `dns:domain.coin` - Domain ownership + trust database CID
+- `trust:domain.coin` - Identity database with merkle proofs  
+- `risk:data_id` - CBOR-encoded data storage
+- `registry:domain.coin:group_id` - Group membership with TPM hashes
 
-## Dependencies Summary
+## Security Model
 
-**Required:**
-- TPM 2.0 hardware
-- Emercoin blockchain node
-- Linux OS with tpm2-tools
-- Python 3.8+
-- Go 1.19+
-- IPFS
-- Bittorrent
+### Zero-Trust Architecture
+- User authentication + machine TPM verification required
+- Hardware-bound identity prevents credential theft
+- Domain owner controls group membership
+- Blockchain provides tamper-proof audit trail
 
-**Recommended:**
-- YubiKey for enhanced security
+### Privacy Considerations
+- Domain registrations are public on Emercoin blockchain
+- Yggdrasil traffic visible to mesh peers
+- TPM keys never leave hardware
+- Group memberships stored on blockchain
 
+## File Structure
 
-## Security Considerations
+```
+brunnen-g-cli/
+├── brunnen-cli.sh              # Main CLI interface
+├── api_daemon.py               # REST API server  
+├── yggdrasil-tpm-startup.sh    # TPM-secured Yggdrasil
+├── data/                       # Local databases
+├── tpm/                        # TPM utilities
+│   ├── tpm_provisioning.sh     # Key generation
+│   └── *.sh                    # Various TPM tools
+├── web/brunnen-g.html          # Web interface
+└── PAM/brunnen-g-pam.c         # Linux authentication module
+```
 
-### Alpha Software Warning
-**Brunnen-G is alpha software under active development. Use at your own risk. Not recommended for production systems at this time.**
+## Roadmap
 
-### Blockchain Visibility
-- All Emercoin transactions and domain records are publicly visible
-- Domain ownership and update history can be tracked
-- Private key loss results in permanent domain loss
+### Phase 1 (Current - Q2 2025)
+- Fix identity registration bugs
+- Stabilize TPM integration
+- Complete API authentication
 
-### Network Dependencies  
-- Yggdrasil connectivity depends on peer availability
-- Traffic is visible to mesh peer nodes
-- IPv6 addresses may reveal location information
+### Phase 2 (Q3 2025) 
+- PAM module deployment
+- Distributed group management
 
-### Legal & Jurisdictional Risks
-- Cryptocurrency usage may be restricted in some jurisdictions
-- Decentralized DNS may conflict with local regulations
-- Users responsible for compliance with applicable laws
+### Phase 3 (Q4 2025)
+- Enterprise group management
+- Wazuh SIEM integration
+- Web interface development and polishing
 
-### Operational Security
-- Regular backup of TPM metadata and Emercoin keys required
-- Domain registration requires EMC cryptocurrency
-- Monitor domain expiration to prevent loss
-- Consider VPN usage over Yggdrasil for additional privacy
+## Security Warnings
 
-**Recommendation**: Evaluate these risks against your threat model before deployment.
+### Alpha Software
+**Brunnen-G is alpha software. Not for production use.**
+
+### Operational Risks
+- Domain loss if private keys compromised
+- Blockchain transactions are permanent and public
+- Cryptocurrency required for domain registration
+- Regular backups essential
+
+### Legal Considerations
+- Cryptocurrency usage restrictions vary by jurisdiction
+- Decentralized DNS may conflict with regulations
+- Users responsible for legal compliance
 
 ## License
 
