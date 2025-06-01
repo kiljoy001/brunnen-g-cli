@@ -13,16 +13,25 @@ import logging
 import uuid
 import re
 import getpass
+import glob
+import sys, shutil
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from systemd.journal import JournalHandler
 
 API_PORT = 8080
-DB_DIR = os.environ.get('BRUNNEN_DB_DIR', '/var/lib/brunnen')
-DB_NAME = os.path.join(DB_DIR, f"{hashlib.sha256((os.uname().nodename + getpass.getuser()).encode()).hexdigest()[:12]}.db")
+DB_DIR = os.environ.get('BRUNNEN_DB_DIR', './data')
+DB_FILES = glob.glob(os.path.join(DB_DIR, "*.db"))
+if not DB_FILES:
+    logging.error("No database found. Run shell script first.")
+    sys.exit(1)
+DB_NAME = DB_FILES[0]
 LOG_FILE = "/var/log/brunnen_api.log"
 MAX_PAYLOAD_SIZE = 1048576  # 1MB
 ADDRESS_REGEX = re.compile(r'^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.(coin|emc|lib|bazar)$')
+
+class SecurityError(Exception): pass
 
 def secure_subprocess(cmd_list, timeout=10, env_vars=None):
     """Secure subprocess execution with validation"""
@@ -44,7 +53,7 @@ def secure_subprocess(cmd_list, timeout=10, env_vars=None):
         text=True,
         check=True
     )
-    
+
 def validate_inputs(data):
     """Comprehensive input validation"""
     if not isinstance(data, dict):
@@ -73,12 +82,12 @@ def decrypt_tpm_metadata():
         challenge = f.read().strip()
     
     # Call YubiKey for decryption
-    result = subprocess.run(['ykchalresp', '-2', '-x', challenge], 
+    result = secure_subprocess(['ykchalresp', '-2', '-x', challenge], 
                           capture_output=True, text=True, check=True)
     aes_key = result.stdout.strip()
     
     # Decrypt metadata
-    subprocess.run([
+    secure_subprocess([
         'openssl', 'enc', '-aes-256-cbc', '-d',
         '-in', '/tpmdata/provisioning.enc',
         '-out', '/tpmdata/provisioning.json',
@@ -113,7 +122,7 @@ try:
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s',
         handlers=[
-            logging.FileHandler(LOG_FILE, mode='a'),
+            JournalHandler(SYSLOG_IDENTIFIER='brunnen-api'),
             logging.StreamHandler()
         ]
     )
@@ -157,39 +166,7 @@ class RateLimiter:
 
 class APIHandler(BaseHTTPRequestHandler):
     rate_limiter = RateLimiter()
-    
-    @staticmethod
-    def setup_database_once():
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    app_name TEXT PRIMARY KEY,
-                    api_key_hash TEXT NOT NULL,
-                    salt TEXT NOT NULL,
-                    permissions TEXT DEFAULT 'read',
-                    rate_limit INTEGER DEFAULT 60,
-                    created_at INTEGER,
-                    last_used INTEGER
-                );
-                
-                CREATE TABLE IF NOT EXISTS api_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT,
-                    timestamp INTEGER,
-                    app_name TEXT,
-                    endpoint TEXT,
-                    method TEXT,
-                    status_code INTEGER,
-                    ip_address TEXT
-                );
-                
-                CREATE TABLE IF NOT EXISTS address_keys (
-                    address TEXT PRIMARY KEY,
-                    pubkey TEXT NOT NULL,
-                    created_at INTEGER
-                );
-            """)
-            conn.commit()
+
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
         self.send_response(200)
@@ -239,7 +216,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Remove newlines and control characters
         return re.sub(r'[\x00-\x1f\x7f-\x9f\n\r]', '', str(text))[:100]
     
-    def log_request(self, request_id, app_name, endpoint, method, status_code):
+    def log_api_request(self, request_id, app_name, endpoint, method, status_code):
         with sqlite3.connect(DB_NAME) as conn:
             conn.execute("""
                 INSERT INTO api_logs 
@@ -286,11 +263,6 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_address(self, address):
         return bool(ADDRESS_REGEX.match(address))
     
-    def validate_username_domain(self, username, domain):
-        # Only alphanumeric, dots, dashes, underscores
-        pattern = re.compile(r'^[a-zA-Z0-9._-]+$')
-        return pattern.match(username) and pattern.match(domain)
-    
     def query_user(self, address):
         try:
             with sqlite3.connect(DB_NAME) as conn:
@@ -305,49 +277,6 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logging.error(f"Database error: {e}")
             return {"status": "error", "message": "Internal server error"}
-    
-    def register_identity(self, username, domain):
-        if not username or not domain:
-            return {"status": "error", "message": "Missing username or domain"}
-        
-        if not self.validate_username_domain(username, domain):
-            return {"status": "error", "message": "Invalid characters in username or domain"}
-        
-        address = f"{username}@{domain}"
-        if not self.validate_address(address):
-            return {"status": "error", "message": "Invalid address format"}
-        
-        try:
-            decrypt_tpm_metadata()
-            # Use absolute path for security
-            script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'tpm','tpm_provisioning.sh'))
-            
-            result = subprocess.run(
-                [script_path], 
-                check=True,
-                timeout=30,
-                capture_output=True,
-                text=True,
-                env={**os.environ, 'USER': username, 'DOMAIN': domain}  # Pass as env vars
-            )
-            
-            # Extract pubkey from result (implement based on script output)
-            pubkey = result.stdout.strip()  # Adjust based on actual output
-            
-            # Store in database
-            with sqlite3.connect(DB_NAME) as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO address_keys (address, pubkey, created_at) 
-                    VALUES (?, ?, ?)
-                """, (address, pubkey, int(time.time())))
-            
-            return {"status": "success", "address": address}
-            
-        except subprocess.TimeoutExpired:
-            return {"status": "error", "message": "TPM provisioning timeout"}
-        except subprocess.CalledProcessError as e:
-            logging.error(f"TPM script failed: {e}")
-            return {"status": "error", "message": "TPM provisioning failed"}
     
     @require_auth('read')
     def handle_query(self, app_name, parsed, request_id):
@@ -407,7 +336,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.send_header('Content-Length', str(len(content)))
                     self.end_headers()
                     self.wfile.write(content.encode())
-                    self.log_request(request_id, None, parsed.path, 'GET', 200)
+                    self.log_api_request(request_id, None, parsed.path, 'GET', 200)
                 except FileNotFoundError:
                     self.send_error_response(404, "web_interface_not_found", "Web interface not available")
             elif endpoint == 'health':
@@ -436,7 +365,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if app_name and not self.rate_limiter.allow_request(app_name, rate_limit):
             self.send_error_response(429, "rate_limit_exceeded", 
                                    f"Rate limit of {rate_limit} requests/minute exceeded")
-            self.log_request(request_id, app_name, parsed.path, 'POST', 429)
+            self.log_api_request(request_id, app_name, parsed.path, 'POST', 429)
             return
 
         # Read and parse body
@@ -455,40 +384,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error_response(400, "invalid_json", "Request body must be valid JSON")
             return
-
-        if parsed.path == '/api/v1/register':
-            if not self.check_permission(permissions, 'write'):
-                self.send_error_response(403, "insufficient_permissions", 
-                                       "Write permission required")
-                self.log_request(request_id, app_name, parsed.path, 'POST', 403)
-                return
-
-            result = self.register_identity(data.get('username'), data.get('domain'))
-            status = 200 if result['status'] == 'success' else 400
-            self.send_json_response(status, result, request_id)
-            self.log_request(request_id, app_name, parsed.path, 'POST', status)
-
-        elif parsed.path == '/api/v1/sign':
-            if not self.check_permission(permissions, 'write'):
-                self.send_error_response(403, "insufficient_permissions", 
-                                       "Write permission required")
-                self.log_request(request_id, app_name, parsed.path, 'POST', 403)
-                return
-
-            signer = data.get('signer')
-            payload = data.get('data')
-
-            if not signer or not payload:
-                self.send_error_response(400, "missing_fields", 
-                                       "signer and data fields required")
-                return
-
-            # Call signing logic (to be implemented)
-            result = {"status": "error", "message": "Signing not yet implemented"}
-            self.send_json_response(501, result, request_id)
-            self.log_request(request_id, app_name, parsed.path, 'POST', 501)
-
-        elif parsed.path == '/api/v1/admin/keys' and self.check_permission(permissions, 'admin'):
+        if parsed.path == '/api/v1/admin/keys' and self.check_permission(permissions, 'admin'):
             # Admin endpoint to manage API keys
             action = data.get('action')
 
@@ -541,12 +437,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_error_response(400, "invalid_action", 
                                        "action must be 'create' or 'revoke'")
 
-            self.log_request(request_id, app_name, parsed.path, 'POST', 200)
+            self.log_api_request(request_id, app_name, parsed.path, 'POST', 200)
 
         else:
             self.send_error_response(404, "endpoint_not_found", 
                                    f"Endpoint {parsed.path} not found")
-            self.log_request(request_id, app_name, parsed.path, 'POST', 404)
+            self.log_api_request(request_id, app_name, parsed.path, 'POST', 404)
 
 
 def generate_api_key():
@@ -557,8 +453,6 @@ def generate_api_key():
     return api_key, salt, key_hash
 
 def main():
-    APIHandler.setup_database_once()
-    
     print(f"Starting Brunnen-G API daemon on port {API_PORT}")
     print("API Version: 1.0.0")
     print(f"Database: {DB_NAME}")

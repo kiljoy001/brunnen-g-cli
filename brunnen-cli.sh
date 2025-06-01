@@ -19,7 +19,7 @@ done
 generate_db_name() {
     local seed=$(hostname)$(whoami)
     local hash=$(echo "$seed" | sha256sum | cut -c1-12)
-    echo "${hash}.tmp"
+    echo "${hash}.db"
 }
 
 DB_NAME=$(generate_db_name)
@@ -49,16 +49,17 @@ run_tpm_script() {
 
 # create_database - builds the distributed database that holds public key data
 create_database() {
-    sqlite3 $DB_NAME "
+    mkdir -p ./data
+    sqlite3 "$DB_NAME" "
     CREATE TABLE IF NOT EXISTS address_keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        address TEXT NOT NULL,
+        address TEXT NOT NULL UNIQUE,
         pubkey TEXT NOT NULL,
         TPM_key TEXT,
         TPM_enable BOOLEAN DEFAULT 1,
         yubikey_hash TEXT DEFAULT '',
         row_hash BLOB
-        );
+    );
     
     CREATE TABLE IF NOT EXISTS db_root (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,12 +70,12 @@ create_database() {
 
     CREATE TABLE IF NOT EXISTS tpm_domain_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        domain TEXT NOT NULL,
+        domain TEXT NOT NULL UNIQUE,
         TPM_enable BOOLEAN DEFAULT 1,
         row_hash BLOB
     );
     "
-    echo "Database created: $DB_NAME"
+    echo "Database created: ./data/$DB_NAME"
 }
 
 verify_domain_ownership() {
@@ -285,12 +286,12 @@ register_identity() {
     address="${username}@${domain}"
     
     echo "Generating TPM keypair..."
-    if ! run_tpm_script ../tpm/tpm_provisioning.sh; then
+    if ! run_tpm_script ./tpm/tpm_provisioning.sh; then
         echo "TPM setup failed - cannot register without TPM"
         return 1
     fi
     
-    tpm_handle=$(cat handle.txt)
+    tpm_handle=$(cat /dev/shm/handle.txt)
     tpm_pubkey=$(tpm2_readpublic -c "$tpm_handle" -f der | xxd -p -c 256)
     
     create_database
@@ -313,7 +314,7 @@ register_identity() {
     fi
     
     echo "Identity registered: $address"
-    echo "TPM handle: $tmp_handle"
+    echo "TPM handle: $tpm_handle"
 }
 
 
@@ -324,7 +325,7 @@ generate_yubikey_cert() {
     echo "Generating YubiKey certificate tied to TPM..."
     
     tpm2_readpublic -c "$tpm_handle" -f pem -o /tmp/tpm_pub.pem
-    ykman piv keys generate 9a /tmp/yubikey_pub.pem
+    ykman piv keys generate 9a /dev/shm/yubikey_pub.pem
     
     openssl req -new -x509 -days 365 \
         -key /tmp/tpm_pub.pem \
@@ -507,7 +508,7 @@ start_yggdrasil() {
     fi
     
     echo "Starting TPM-secured Yggdrasil..."
-    if run_tpm_script ../yggdrasil-tpm-startup.sh; then
+    if run_tpm_script ./yggdrasil-tpm-startup.sh; then
         sleep 3
         local ygg_addr=$(yggdrasilctl getSelf | grep -oE '200:[a-f0-9:]+' || echo "none")
         echo "Yggdrasil started: $ygg_addr"
@@ -535,7 +536,7 @@ API_LOG="/tmp/brunnen_api.log"
 init_api_key() {
     if [[ ! -f "$HMAC_KEY_FILE" ]]; then
         echo "Generating API HMAC key..."
-        if run_tpm_script ../tpm/tpm_random_number.sh -b 32 -f hex -o "$HMAC_KEY_FILE"; then
+        if run_tpm_script ./tpm/tpm_random_number.sh -b 32 -f hex -o "$HMAC_KEY_FILE"; then
             echo "TPM-generated HMAC key created"
         else
             openssl rand -hex 32 > "$HMAC_KEY_FILE"
@@ -564,13 +565,13 @@ api_register() {
     
     address="${username}@${domain}"
     
-    if run_tpm_script ../tpm/tpm_provisioning.sh; then
+    if run_tpm_script ./tpm/tpm_provisioning.sh; then
         tmp_handle=$(cat handle.txt)
         tmp_pubkey=$(tpm2_readpublic -c "$tpm_handle" -f der | xxd -p -c 256)
         
         create_database
         sqlite3 "$DB_NAME" "INSERT INTO address_keys (address, pubkey, TPM_key, TPM_enable) 
-                           VALUES ('$address', '$tmp_pubkey', '$tmp_handle', 1);"
+                           VALUES ('$address', '$tpm_pubkey', '$tmp_handle', 1);"
         
         echo "{\"status\":\"success\",\"address\":\"$address\",\"tpm_handle\":\"$tmp_handle\"}"
     else
@@ -913,6 +914,14 @@ decrypt_metadata() {
     echo "Metadata decrypted"
 }
 
+quick_setup() {
+    echo "=== Quick Setup ==="
+    register_identity
+    start_yggdrasil
+    start_api_daemon
+    echo "Setup complete! Your identity is registered and services are running."
+}
+
 echo -e "\033[32m"
 echo "
 ██████╗ ██████╗ ██╗   ██╗███╗   ██╗███╗   ██╗███████╗███╗   ██╗       ██████╗ 
@@ -924,43 +933,6 @@ echo "
                         Decentralized Public Key Infrastructure
 "
 echo -e "\033[36mcybersec.mesh_authenticated\033[0m"
-
-while true; do
-    if [[ "$HACKER_MODE" == "1" ]]; then
-        echo -e "\033[32m=== [SYSTEM_ACCESS] ===\033[0m"
-        echo -e "\033[32m1) init\033[0m.\033[37midentity_bootstrap\033[0m"
-        echo -e "\033[32m2) query\033[0m.\033[37muser_database\033[0m" 
-        echo -e "\033[32m3) mesh\033[0m.\033[37mnetwork_ops\033[0m"
-        echo -e "\033[32m4) admin\033[0m.\033[37mroot_access\033[0m"
-        echo -e "\033[32m5) logout\033[0m.\033[37msecure\033[0m"
-    else
-        echo "=== Brunnen-G ==="
-        echo "1) Quick Setup (Register + Start Services)"
-        echo "2) Identity Operations"
-        echo "3) Network & Communication"
-        echo "4) Advanced Settings"
-        echo "5) Exit"
-    fi
-    echo -n "Choice: "
-    
-    read choice
-    case $choice in
-        1) quick_setup ;;
-        2) identity_menu ;;
-        3) network_menu ;;
-        4) advanced_menu ;;
-        5) exit 0 ;;
-    esac
-done
-
-quick_setup() {
-    echo "=== Quick Setup ==="
-    register_identity
-    start_yggdrasil
-    start_api_daemon
-    echo "Setup complete! Your identity is registered and services are running."
-}
-
 identity_menu() {
     if [[ "$HACKER_MODE" == "1" ]]; then
         echo -e "\033[32m=== [IDENTITY_CORE] ===\033[0m"
@@ -993,6 +965,7 @@ network_menu() {
         echo "2) Configure VoIP"
         echo "3) Send message (coming soon)"
         echo -n "Choice: "
+    fi
     read choice
     
     case $choice in
@@ -1008,6 +981,7 @@ network_menu() {
             ;;
         2) configure_voip ;;
         3) echo "Messaging not yet implemented" ;;
+    
     esac
 }
 
@@ -1030,7 +1004,15 @@ advanced_menu() {
     
     read choice
     case $choice in
-        1) manage_api_keys ;;
+        1) echo "1) Create  2) List  3) Revoke"
+            echo -n "API action: "
+            read api_choice
+            case $api_choice in
+                1) manage_api_keys "create" ;;
+                2) manage_api_keys "list" ;;
+                3) manage_api_keys "revoke" ;;
+            esac
+            ;;
         2) database_operations ;;
         3) tmp_maintenance ;;
         4) wazuh_menu ;;
@@ -1110,6 +1092,34 @@ tmp_maintenance() {
         1) tmp2_getcap handles-persistent ;;
         2) encrypt_metadata ;;
         3) decrypt_metadata ;;
-        4) run_tpm_script ../tpm/tpm_provisioning.sh ;;
+        4) run_tpm_script ./tpm/tpm_provisioning.sh ;;
     esac
 }
+
+while true; do
+    if [[ "$HACKER_MODE" == "1" ]]; then
+        echo -e "\033[32m=== [SYSTEM_ACCESS] ===\033[0m"
+        echo -e "\033[32m1) init\033[0m.\033[37midentity_bootstrap\033[0m"
+        echo -e "\033[32m2) query\033[0m.\033[37muser_database\033[0m" 
+        echo -e "\033[32m3) mesh\033[0m.\033[37mnetwork_ops\033[0m"
+        echo -e "\033[32m4) admin\033[0m.\033[37mroot_access\033[0m"
+        echo -e "\033[32m5) logout\033[0m.\033[37msecure\033[0m"
+    else
+        echo "=== Brunnen-G ==="
+        echo "1) Quick Setup (Register + Start Services)"
+        echo "2) Identity Operations"
+        echo "3) Network & Communication"
+        echo "4) Advanced Settings"
+        echo "5) Exit"
+    fi
+    echo -n "Choice: "
+    
+    read choice
+    case $choice in
+        1) quick_setup ;;
+        2) identity_menu ;;
+        3) network_menu ;;
+        4) advanced_menu ;;
+        5) exit 0 ;;
+    esac
+done

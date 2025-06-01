@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # --- Configuration ---
-LOG_DIR="/var/log"
+mem_file_sys="/dev/shm/"
+LOG_DIR=${mem_file_sys}
 LOG_FILE="${LOG_DIR}/tpm_setup_$(date +%Y%m%d_%H%M%S).log"
 ALLOW_CLEANUP_ON_FAIL=false  # Set to false for debugging partial executions
 TPM_PERSISTENT_BASE=0x81000000
@@ -45,14 +46,14 @@ cleanup() {
         log_warn "Cleaning up after failure..."
 
         # Evict persistent handle if created
-        if [[ -f handle.txt ]]; then
-            local handle=$(cat handle.txt 2>/dev/null)
+        if [[ -f ${mem_file_sys}/handle.txt ]]; then
+            local handle=$(cat ${mem_file_sys}/handle.txt 2>/dev/null)
             tpm2_evictcontrol -C e "${handle}" >/dev/null 2>&1 || true
             log_warn "Evicted persistent handle: ${handle}"
         fi
 
         # Remove temporary files
-        rm -f ek.ctx signing_key.* handle.txt 2>/dev/null
+        rm -f ${mem_file_sys}/ek.ctx ${mem_file_sys}/signing_key.* ${mem_file_sys}/handle.txt 2>/dev/null
     fi
 }
 trap cleanup EXIT
@@ -84,7 +85,7 @@ find_available_handle() {
         local handle_hex=$(printf "0x%08X" ${handle})
 
         if [[ ! " ${used_handles[@]} " =~ " ${handle_hex} " ]]; then
-            echo "${handle_hex}" > handle.txt
+            echo "${handle_hex}" > ${mem_file_sys}/handle.txt
             return 0
         fi
     done
@@ -110,18 +111,18 @@ main() {
 
     # Find and store persistent handle
     find_available_handle
-    persistent_handle=$(cat handle.txt)
+    persistent_handle=$(cat ${mem_file_sys}/handle.txt)
     log_info "Persistent handle stored in handle.txt"
 
     # Create Endorsement Key
     log_info "Creating Endorsement Key (ECC)..."
-    if ! tpm2_createek -c ek.ctx -G ecc -u ek.pub >> "${LOG_FILE}" 2>&1; then
+    if ! tpm2_createek -c ${mem_file_sys}/ek.ctx -G ecc -u ${mem_file_sys}/ek.pub >> "${LOG_FILE}" 2>&1; then
         log_error "Failed to create Endorsement Key. Check ${LOG_FILE} for details."
     fi
 
     # Create Signing Key
     log_info "Generating signing key..."
-    if ! tpm2_createak -C ek.ctx -c ak.ctx -G ecc -u signing_key.pub >> "${LOG_FILE}" 2>&1; then
+    if ! tpm2_createak -C ${mem_file_sys}/ek.ctx -c ${mem_file_sys}/ak.ctx -G ecc -u ${mem_file_sys}/signing_key.pub >> "${LOG_FILE}" 2>&1; then
         log_error "Failed to create signing key. Check ${LOG_FILE} for details."
     fi
 
@@ -129,13 +130,13 @@ main() {
     log_info "Persisting signing key..."
  
     log_info "Presist handle set to "${persistent_handle}""
-    if ! tpm2_evictcontrol -C o -c ak.ctx "${persistent_handle}" >> "${LOG_FILE}" 2>&1; then
+    if ! tpm2_evictcontrol -C o -c ${mem_file_sys}/ak.ctx "${persistent_handle}" >> "${LOG_FILE}" 2>&1; then
         log_error "Failed to persist signing key. Check ${LOG_FILE} for details."
     fi
 
     # Export public key
     log_info "Exporting public key..."
-    if ! tpm2_readpublic -c "${persistent_handle}" -f pem -o signing_key.pem >> "${LOG_FILE}" 2>&1; then
+    if ! tpm2_readpublic -c "${persistent_handle}" -f pem -o ${mem_file_sys}/signing_key.pem >> "${LOG_FILE}" 2>&1; then
         log_error "Failed to export public key. Check ${LOG_FILE} for details."
     fi
 
