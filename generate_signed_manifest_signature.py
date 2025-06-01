@@ -58,14 +58,14 @@ def sign_manifest(script_hashes, tpm_handle):
     with open('/tmp/manifest.json', 'w') as f:
         f.write(manifest_data)
     
-    print(f"Signing manifest with TPM handle: {tmp_handle}")
+    print(f"Signing manifest with TPM handle: {tpm_handle}")
     
     # Sign with TPM
     try:
         result = subprocess.run([
-            f"{SCRIPT_DIR}/tmp_sign_data.sh",
+            f"{SCRIPT_DIR}/tpm_sign_data.sh",
             "/tmp/manifest.json",
-            tmp_handle
+            tpm_handle
         ], capture_output=True, text=True, check=True)
         
         signature = result.stdout.strip()
@@ -76,7 +76,7 @@ def sign_manifest(script_hashes, tpm_handle):
         print(f"Error signing manifest: {e}")
         return None
 
-def get_tpm_public_key(tmp_handle):
+def get_tpm_public_key(tpm_handle):
     """Extract TPM public key"""
     try:
         result = subprocess.run([
@@ -151,7 +151,7 @@ def main():
     
     # Get TPM handle
     print("\n2. Getting TPM handle...")
-    tmp_handle = get_tpm_handle()
+    tpm_handle = get_tpm_handle()
     
     # Sign manifest
     print("\n3. Signing manifest...")

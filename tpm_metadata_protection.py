@@ -8,6 +8,7 @@ import hashlib
 import subprocess
 import tempfile
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -20,8 +21,8 @@ class TPMMetadataError(Exception):
 class TPMMetadataProtection:
     """Secure TPM metadata encryption/decryption using YubiKey"""
     
-    def __init__(self, tpm_dir="/tpmdata"):
-        self.tpm_dir = Path(tmp_dir)
+    def __init__(self, tpm_dir="./tpmdata"):
+        self.tpm_dir = Path(tpm_dir)
         self.challenge_file = self.tpm_dir / ".challenge"
         self.encrypted_file = self.tpm_dir / "provisioning.enc"
         self.temp_json_file = self.tpm_dir / "provisioning.json"
@@ -63,7 +64,7 @@ class TPMMetadataProtection:
                 raise TPMMetadataError(f"YubiKey challenge failed: {result.stderr}")
             
             response = result.stdout.strip()
-            if len(response) != 64:  # 32 bytes = 64 hex chars
+            if len(response) != 40:  # 32 bytes = 64 hex chars
                 raise TPMMetadataError("Invalid YubiKey response length")
                 
             return response
