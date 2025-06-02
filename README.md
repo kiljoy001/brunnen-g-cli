@@ -29,6 +29,7 @@ Brunnen-G provides secure identity management through TPM-secured keys, blockcha
 ### Enterprise Features (Phase 3)
 - **Zero-Trust Authentication**: User + machine TPM verification required
 - **Wazuh SIEM**: Security monitoring and threat detection
+- **Keycloak Intergration**: OAuth intergration for wider use and utility
 
 ## Requirements
 
@@ -185,9 +186,9 @@ brunnen-g-cli/
 ### Phase 2 (Q3 2025) 
 - PAM module deployment
 - Distributed group management
+- Data layer (CBOR/IPFS/Bittorent)
 
 ### Phase 3 (Q4 2025)
-- Enterprise group management
 - Wazuh SIEM integration
 - Web interface development and polishing
 
