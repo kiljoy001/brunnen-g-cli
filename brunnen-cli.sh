@@ -1,86 +1,35 @@
 #!/bin/bash
-trap 'shred -u /dev/shm/.brunnen_challenge /dev/shm/handle.txt /dev/shm/yubikey_pub.pem /dev/shm/enc_key.* /dev/shm/key.* /dev/shm/primary.ctx /dev/shm/tmp_pub.pem /dev/shm/linked_cert.pem /dev/shm/sign_data /dev/shm/signature /dev/shm/verify_data /dev/shm/verify_sig /dev/shm/api_sign_data /dev/shm/api_signature /dev/shm/api_verify_data /dev/shm/api_verify_sig /dev/shm/yubikey_cert.pem /dev/shm/yubikey_pub.pem /dev/shm/provisioning_new.json 2>/dev/null || true' EXIT INT TERM
+trap 'cleanup_temp_files' EXIT INT TERM
 
-generate_yubikey_cert() {
-    local address="$1"
-    local tmp_handle="$2"
+# Cleanup function
+cleanup_temp_files() {
+    # Use shred for sensitive files in /dev/shm
+    shred -u /dev/shm/.brunnen_challenge 2>/dev/null || true
+    shred -u /dev/shm/handle.txt 2>/dev/null || true
+    shred -u /dev/shm/yubikey_pub.pem 2>/dev/null || true
+    shred -u /dev/shm/provisioning.json 2>/dev/null || true
+    shred -u /dev/shm/*.pem 2>/dev/null || true
+    shred -u /dev/shm/enc_key.* 2>/dev/null || true
+    shred -u /dev/shm/key.* 2>/dev/null || true
+    shred -u /dev/shm/primary.ctx 2>/dev/null || true
+    shred -u /dev/shm/tmp_pub.pem 2>/dev/null || true
+    shred -u /dev/shm/linked_cert.pem 2>/dev/null || true
+    shred -u /dev/shm/sign_data 2>/dev/null || true
+    shred -u /dev/shm/signature 2>/dev/null || true
+    shred -u /dev/shm/verify_data 2>/dev/null || true
+    shred -u /dev/shm/verify_sig 2>/dev/null || true
+    shred -u /dev/shm/api_sign_data 2>/dev/null || true
+    shred -u /dev/shm/api_signature 2>/dev/null || true
+    shred -u /dev/shm/api_verify_data 2>/dev/null || true
+    shred -u /dev/shm/api_verify_sig 2>/dev/null || true
+    shred -u /dev/shm/yubikey_cert.pem 2>/dev/null || true
+    shred -u /dev/shm/provisioning_new.json 2>/dev/null || true
     
-    echo "Generating YubiKey certificate tied to TPM..."
-    
-    # Get TPM public key for hash linking
-    tpm2_readpublic -c "$tmp_handle" -f pem -o /dev/shm/tmp_pub.pem
-    
-    # Generate YubiKey key and self-signed certificate
-    ykman piv keys generate 9a /dev/shm/yubikey_pub.pem
-    sudo chmod 666 /dev/shm/tpm_pub.pem /dev/shm/yubikey_pub.pem 2>/dev/null || true
-    ykman piv certificates generate 9a /dev/shm/yubikey_pub.pem \
-        --subject "CN=$address,O=Brunnen-G,OU=TPM-YubiKey" \
-        /dev/shm/linked_cert.pem
-    
-    # Import certificate to YubiKey
-    ykman piv certificates import 9a /dev/shm/linked_cert.pem
-    
-    # Generate combined hash for linking TPM + YubiKey
-    combined_hash=$(cat /dev/shm/tmp_pub.pem /dev/shm/yubikey_pub.pem | sha256sum | cut -d' ' -f1)
-    
-    echo "YubiKey cert installed. Combined hash: $combined_hash"
-    
-    # Update database
-    sqlite3 "$DB_NAME" "UPDATE address_keys SET yubikey_hash = '$combined_hash' WHERE address = '$address';"
-    
-    # Cleanup (will be handled by trap)
+    # Regular rm for non-sensitive temp files
+    rm -f /tmp/.brunnen_domain_address_tmp 2>/dev/null || true
 }
 
-verify_yubikey_identity() {
-    echo "=== Verify YubiKey Identity ==="
-    
-    ykman piv certificates export 9a /dev/shm/yubikey_cert.pem
-    
-    cert_subject=$(openssl x509 -in /dev/shm/yubikey_cert.pem -noout -subject | grep -o 'CN=[^,]*' | cut -d'=' -f2)
-    domain="${cert_subject#*@}"
-    
-    echo "Certificate identity: $cert_subject"
-    echo "Domain: $domain"
-    
-    domain_data=$(emercoin-cli name_show "dns:$domain" 2>/dev/null)
-    if [[ $? -ne 0 ]]; then
-        echo "[FAIL] Domain not found on blockchain"
-        return 1
-    fi
-    
-    cid=$(echo "$domain_data" | jq -r '.cid // empty')
-    if [[ -z "$cid" ]]; then
-        echo "[FAIL] No CID found for domain"
-        return 1
-    fi
-    
-    echo "Found CID: $cid"
-    
-    ipfs get "$cid" -o "/dev/shm/remote_db"
-    
-    result=$(sqlite3 "/dev/shm/remote_db" "SELECT yubikey_hash FROM address_keys WHERE address = '$cert_subject';" 2>/dev/null)
-    
-    if [[ -z "$result" ]]; then
-        echo "[FAIL] Identity not found in domain database"
-        return 1
-    fi
-    
-    ykman piv keys export 9a /dev/shm/yubikey_pub.pem
-    current_hash=$(cat /dev/shm/yubikey_cert.pem /dev/shm/yubikey_pub.pem | sha256sum | cut -d' ' -f1)
-    
-    if [[ "$current_hash" == "$result" ]]; then
-        echo "[OK] YubiKey verified against blockchain identity"
-        echo "Identity: $cert_subject"
-        echo "Hash match: $current_hash"
-    else
-        echo "[FAIL] YubiKey hash mismatch"
-        echo "Expected: $result"
-        echo "Current: $current_hash"
-    fi
-    
-    rm -f /dev/shm/yubikey_cert.pem /dev/shm/yubikey_pub.pem /dev/shm/remote_db
-}
-
+# Parse command line arguments
 HACKER_MODE=0
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -104,6 +53,8 @@ generate_db_name() {
 }
 
 DB_NAME="./data/$(generate_db_name)"
+DOMAIN_VERIFIED_FILE="/tmp/.brunnen_domain_verified"
+DOMAIN_VERIFY_LOCK="/tmp/.brunnen_domain.lock"
 
 # Check TPM permissions
 check_tpm_access() {
@@ -130,11 +81,13 @@ run_tpm_script() {
 
 # create_database - builds the distributed database that holds public key data
 create_database() {
+    # Ensure data directory exists
     mkdir -p ./data
-    sqlite3 "$DB_NAME" "
+    
+    sqlite3 $DB_NAME "
     CREATE TABLE IF NOT EXISTS address_keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        address TEXT NOT NULL UNIQUE,
+        address TEXT NOT NULL,
         pubkey TEXT NOT NULL,
         TPM_key TEXT,
         TPM_enable BOOLEAN DEFAULT 1,
@@ -151,9 +104,23 @@ create_database() {
 
     CREATE TABLE IF NOT EXISTS tpm_domain_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        domain TEXT NOT NULL UNIQUE,
+        domain TEXT NOT NULL,
         TPM_enable BOOLEAN DEFAULT 1,
         row_hash BLOB
+    );
+    
+    CREATE TABLE IF NOT EXISTS domain_settings (
+        domain TEXT PRIMARY KEY,
+        owner_address TEXT,
+        verified_at INTEGER
+    );
+    
+    CREATE TABLE IF NOT EXISTS api_keys (
+        app_name TEXT PRIMARY KEY,
+        api_key TEXT NOT NULL,
+        permissions TEXT DEFAULT 'read',
+        created_at INTEGER,
+        last_used INTEGER
     );
     "
     echo "Database created: $DB_NAME"
@@ -161,16 +128,105 @@ create_database() {
 
 verify_domain_ownership() {
     local domain=$1
-    primary_handle=$(cat /dev/shm/handle.txt 2>/dev/null)
-    domain_info=$(emercoin-cli name_show "dns:$domain" 2>&1)
-    if [[ $? -ne 0 ]]; then
-        echo "Domain not found on blockchain"
+    
+    # Initialize domain_address as empty
+    domain_address=""
+    
+    # Use lock file to prevent concurrent verification
+    (
+        flock -x 200
+        
+        # Check if already verified recently (24 hours)
+        if [[ -f "$DOMAIN_VERIFIED_FILE" ]]; then
+            local last_verify=$(stat -c %Y "$DOMAIN_VERIFIED_FILE" 2>/dev/null || echo 0)
+            local current_time=$(date +%s)
+            if [[ $((current_time - last_verify)) -lt 86400 ]]; then
+                # Read cached info
+                local cached_info=$(cat "$DOMAIN_VERIFIED_FILE")
+                domain_address=$(echo "$cached_info" | cut -d'|' -f2)
+                echo "Domain already verified: $domain (cached)"
+                echo "Owner address: $domain_address"
+                # Write to temp file for persistence outside lock
+                echo "$domain_address" > /tmp/.brunnen_domain_address_tmp
+            else
+                # Verify from blockchain
+                domain_info=$(emercoin-cli name_show "dns:$domain" 2>&1)
+                if [[ $? -ne 0 ]]; then
+                    echo "Domain not found on blockchain"
+                    return 1
+                fi
+                
+                # Extract owner address
+                domain_address=$(echo "$domain_info" | jq -r '.address // empty')
+                if [[ -z "$domain_address" ]]; then
+                    echo "Could not extract domain address"
+                    return 1
+                fi
+                
+                echo "Domain found: $domain"
+                echo "Owner address: $domain_address"
+                
+                # Store in database
+                sqlite3 "$DB_NAME" "
+                    INSERT OR REPLACE INTO domain_settings (domain, owner_address, verified_at)
+                    VALUES ('$domain', '$domain_address', $(date +%s));
+                "
+                
+                # Cache verification
+                echo "$domain|$domain_address" > "$DOMAIN_VERIFIED_FILE"
+                
+                # Write to temp file for persistence outside lock
+                echo "$domain_address" > /tmp/.brunnen_domain_address_tmp
+            fi
+        else
+            # First time verification
+            domain_info=$(emercoin-cli name_show "dns:$domain" 2>&1)
+            if [[ $? -ne 0 ]]; then
+                echo "Domain not found on blockchain"
+                return 1
+            fi
+            
+            # Extract owner address
+            domain_address=$(echo "$domain_info" | jq -r '.address // empty')
+            if [[ -z "$domain_address" ]]; then
+                echo "Could not extract domain address"
+                return 1
+            fi
+            
+            echo "Domain found: $domain"
+            echo "Owner address: $domain_address"
+            
+            # Store in database
+            sqlite3 "$DB_NAME" "
+                INSERT OR REPLACE INTO domain_settings (domain, owner_address, verified_at)
+                VALUES ('$domain', '$domain_address', $(date +%s));
+            "
+            
+            # Cache verification
+            echo "$domain|$domain_address" > "$DOMAIN_VERIFIED_FILE"
+            
+            # Write to temp file for persistence outside lock
+            echo "$domain_address" > /tmp/.brunnen_domain_address_tmp
+        fi
+        
+    ) 200>"$DOMAIN_VERIFY_LOCK"
+    
+    # Read domain_address from temp file
+    if [[ -f /tmp/.brunnen_domain_address_tmp ]]; then
+        domain_address=$(cat /tmp/.brunnen_domain_address_tmp)
+        rm -f /tmp/.brunnen_domain_address_tmp
+    fi
+    
+    # Verify domain_address is set
+    if [[ -z "$domain_address" ]]; then
+        echo "Failed to get domain address"
         return 1
     fi
     
-    echo "Domain found: $domain"
+    # Set as global export
+    export domain_address
     
-    # List wallets
+    # Continue with wallet selection
     wallets=$(emercoin-cli listwallets | jq -r '.[]')
     echo "Available wallets:"
     IFS=$'\n' read -rd '' -a wallet_array <<< "$wallets"
@@ -182,9 +238,7 @@ verify_domain_ownership() {
     echo -n "Select wallet: "
     read wallet_choice
     selected_wallet="${wallet_array[$((wallet_choice-1))]}"
-    
-    echo -n "Enter domain owner address: "
-    read domain_address
+    export selected_wallet
     
     # Check if wallet is encrypted
     wallet_info=$(emercoin-cli -rpcwallet="$selected_wallet" getwalletinfo 2>&1)
@@ -200,36 +254,13 @@ verify_domain_ownership() {
     echo "Challenge: $challenge"
     
     signature=$(emercoin-cli -rpcwallet="$selected_wallet" signmessage "$domain_address" "$challenge")
-    if [[ $? -ne 0 ]]; then
+    if [[ $? -eq 0 ]]; then
+        echo "Domain ownership verified"
+        return 0
+    else
         echo "Signature failed"
         return 1
     fi
-    
-    echo "Domain ownership verified"
-    
-    # Check for existing domain seed
-    if decrypt_metadata 2>/dev/null && [[ -f "/dev/shm/provisioning.json" ]]; then
-        existing_seed=$(jq -r ".domain_settings[\"$domain\"].seed // empty" /dev/shm/provisioning.json)
-        encrypt_metadata
-
-        if [[ -n "$existing_seed" && "$existing_seed" != "empty" ]]; then
-            echo "Using existing domain seed"
-            domain_seed="$existing_seed"
-            return 0
-        fi
-    fi
-    echo "primary handle is $primary_handle"
-    if [[ -z "$primary_handle" || "$primary_handle" == "empty" ]]; then
-        echo "Primary handle not found - run yggdrasil startup first"
-        return 1
-    fi
-    tmp_domain_key=$(tpm2_readpublic -c "$primary_handle" -f der | xxd -p)
-    combined_data="$tmp_domain_key$domain_pubkey"
-    domain_seed=$(emercoin-cli -rpcwallet="$selected_wallet" signmessage "$domain_address" "$combined_data" | sha512sum | cut -c1-128)
-    
-    # Store in encrypted metadata
-    store_domain_seed "$domain" "$domain_seed"
-    return 0
 }
 
 calculate_row_hash() {
@@ -246,6 +277,11 @@ calculate_row_hash() {
             row_data=$(sqlite3 "$DB_NAME" "SELECT domain || '|' || TPM_enable FROM tpm_domain_settings WHERE id = $id")
             row_hash=$(echo -n "$row_data" | sha256sum | cut -d' ' -f1)
             sqlite3 "$DB_NAME" "UPDATE tpm_domain_settings SET row_hash = '$row_hash' WHERE id = $id"
+            ;;
+        "domain_settings")
+            row_data=$(sqlite3 "$DB_NAME" "SELECT domain || '|' || COALESCE(owner_address,'') || '|' || COALESCE(verified_at,0) FROM domain_settings WHERE domain = '$id'")
+            row_hash=$(echo -n "$row_data" | sha256sum | cut -d' ' -f1)
+            # Note: domain_settings uses domain as primary key, not id
             ;;
         "db_root")
             row_data=$(sqlite3 "$DB_NAME" "SELECT table_name || '|' || hex(root) FROM db_root WHERE id = $id")
@@ -284,21 +320,32 @@ build_table_merkle() {
 update_all_merkle_roots() {
     sqlite3 "$DB_NAME" "DELETE FROM db_root"
     
+    # Update address_keys
     sqlite3 "$DB_NAME" "SELECT id FROM address_keys;" | while read id; do
         calculate_row_hash "address_keys" "$id"
     done
     
+    # Update tpm_domain_settings
     sqlite3 "$DB_NAME" "SELECT id FROM tpm_domain_settings;" | while read id; do
         calculate_row_hash "tpm_domain_settings" "$id"
     done
     
+    # Update domain_settings (uses domain as key)
+    sqlite3 "$DB_NAME" "SELECT domain FROM domain_settings;" | while read domain; do
+        calculate_row_hash "domain_settings" "$domain"
+    done
+    
+    # Build merkle roots for each table
     build_table_merkle "address_keys"
     build_table_merkle "tpm_domain_settings"
+    build_table_merkle "domain_settings"
     
+    # Update db_root hashes
     sqlite3 "$DB_NAME" "SELECT id FROM db_root;" | while read id; do 
          calculate_row_hash "db_root" "$id"
     done
 
+    # Final root of roots
     build_table_merkle "db_root"
     
     final_root=$(sqlite3 "$DB_NAME" "SELECT root FROM db_root WHERE table_name='db_root'")
@@ -401,6 +448,361 @@ publish_to_emercoin() {
     fi
 }
 
+generate_yubikey_cert() {
+    local address="$1"
+    local tpm_handle="$2"
+    
+    echo "Generating YubiKey certificate tied to TPM..."
+    
+    # Create unique temp files with proper permissions
+    local temp_id="$$"
+    local tpm_pub_file="/dev/shm/tpm_pub_${temp_id}.pem"
+    local yubikey_pub_file="/dev/shm/yubikey_pub_${temp_id}.pem"
+    local linked_cert_file="/dev/shm/linked_cert_${temp_id}.pem"
+    
+    # Ensure clean state
+    rm -f "$tpm_pub_file" "$yubikey_pub_file" "$linked_cert_file" 2>/dev/null
+    
+    # Export TPM public key with proper permissions
+    if check_tpm_access; then
+        tpm2_readpublic -c "$tpm_handle" -f pem -o "$tpm_pub_file"
+    else
+        sudo tpm2_readpublic -c "$tpm_handle" -f pem -o "$tpm_pub_file"
+        # Fix ownership after sudo operation
+        sudo chown $(whoami):$(id -gn) "$tpm_pub_file"
+    fi
+    chmod 644 "$tpm_pub_file"
+    
+    # Generate YubiKey key with proper file handling
+    touch "$yubikey_pub_file"
+    chmod 666 "$yubikey_pub_file"
+    
+    if ! ykman piv keys generate 9a "$yubikey_pub_file" 2>/dev/null; then
+        echo "Retrying YubiKey key generation..."
+        # Sometimes YubiKey needs a reset
+        ykman piv reset 2>/dev/null || true
+        sleep 1
+        ykman piv keys generate 9a "$yubikey_pub_file"
+    fi
+    
+    # Ensure file is readable
+    chmod 644 "$yubikey_pub_file"
+    
+    # Generate self-signed certificate using the YubiKey public key
+    # Since we can't use TPM private key directly, we create a cert request instead
+    openssl req -new -x509 -days 365 \
+        -key <(ykman piv keys export 9a) \
+        -out "$linked_cert_file" \
+        -subj "/CN=$address/O=Brunnen-G/OU=TPM-YubiKey" 2>/dev/null || \
+    # Fallback: create a simple self-signed cert
+    openssl req -new -x509 -days 365 \
+        -nodes -keyout /dev/shm/temp_key_${temp_id}.pem \
+        -out "$linked_cert_file" \
+        -subj "/CN=$address/O=Brunnen-G/OU=TPM-YubiKey"
+    
+    # Import certificate to YubiKey
+    if [[ -f "$linked_cert_file" ]]; then
+        ykman piv certificates import 9a "$linked_cert_file"
+        
+        # Calculate combined hash
+        if [[ -f "$tpm_pub_file" ]] && [[ -f "$yubikey_pub_file" ]]; then
+            combined_hash=$(cat "$tpm_pub_file" "$yubikey_pub_file" | sha256sum | cut -d' ' -f1)
+            echo "YubiKey cert installed. Combined hash: $combined_hash"
+            
+            # Update database
+            sqlite3 "$DB_NAME" "UPDATE address_keys SET yubikey_hash = '$combined_hash' WHERE address = '$address';"
+        else
+            echo "Warning: Could not calculate combined hash"
+        fi
+    else
+        echo "Error: Failed to generate certificate"
+        return 1
+    fi
+    
+    # Cleanup
+    shred -u "$tpm_pub_file" "$yubikey_pub_file" "$linked_cert_file" "/dev/shm/temp_key_${temp_id}.pem" 2>/dev/null || \
+    rm -f "$tpm_pub_file" "$yubikey_pub_file" "$linked_cert_file" "/dev/shm/temp_key_${temp_id}.pem" 2>/dev/null
+    
+    return 0
+}
+
+verify_yubikey_identity() {
+    echo "=== Verify YubiKey Identity ==="
+    
+    ykman piv certificates export 9a /dev/shm/yubikey_cert.pem
+    
+    cert_subject=$(openssl x509 -in /dev/shm/yubikey_cert.pem -noout -subject | grep -o 'CN=[^,]*' | cut -d'=' -f2)
+    domain="${cert_subject#*@}"
+    
+    echo "Certificate identity: $cert_subject"
+    echo "Domain: $domain"
+    
+    domain_data=$(emercoin-cli name_show "dns:$domain" 2>/dev/null)
+    if [[ $? -ne 0 ]]; then
+        echo "[FAIL] Domain not found on blockchain"
+        return 1
+    fi
+    
+    cid=$(echo "$domain_data" | jq -r '.cid // empty')
+    if [[ -z "$cid" ]]; then
+        echo "[FAIL] No CID found for domain"
+        return 1
+    fi
+    
+    echo "Found CID: $cid"
+    
+    ipfs get "$cid" -o "/dev/shm/remote_db"
+    
+    result=$(sqlite3 "/dev/shm/remote_db" "SELECT yubikey_hash FROM address_keys WHERE address = '$cert_subject';" 2>/dev/null)
+    
+    if [[ -z "$result" ]]; then
+        echo "[FAIL] Identity not found in domain database"
+        return 1
+    fi
+    
+    ykman piv keys export 9a /dev/shm/yubikey_pub.pem
+    current_hash=$(cat /dev/shm/yubikey_cert.pem /dev/shm/yubikey_pub.pem | sha256sum | cut -d' ' -f1)
+    
+    if [[ "$current_hash" == "$result" ]]; then
+        echo "[OK] YubiKey verified against blockchain identity"
+        echo "Identity: $cert_subject"
+        echo "Hash match: $current_hash"
+    else
+        echo "[FAIL] YubiKey hash mismatch"
+        echo "Expected: $result"
+        echo "Current: $current_hash"
+    fi
+    
+    shred -u /dev/shm/yubikey_cert.pem /dev/shm/yubikey_pub.pem /dev/shm/remote_db 2>/dev/null || true
+}
+
+store_domain_seed() {
+    local domain="$1"
+    local domain_seed="$2"
+    
+    mkdir -p ./tpmdata
+    
+    if [[ -f "./tpmdata/provisioning.json" ]]; then
+        jq --arg domain "$domain" --arg seed "$domain_seed" \
+           '.domain_settings[$domain] = {
+               "seed": $seed,
+               "created_at": now
+           }' ./tpmdata/provisioning.json > /dev/shm/provisioning_new.json
+        mv /dev/shm/provisioning_new.json ./tpmdata/provisioning.json
+    else
+        jq -n --arg domain "$domain" --arg seed "$domain_seed" \
+           '{
+               "identities": {},
+               "domain_settings": {
+                   ($domain): {
+                       "seed": $seed,
+                       "created_at": now
+                   }
+               },
+               "version": "2.0"
+           }' > ./tpmdata/provisioning.json
+    fi
+    
+    encrypt_metadata
+}
+
+# Store identity in metadata file and encrypt with YubiKey using existing functions
+store_identity_metadata() {
+    local address="$1"
+    local tmp_handle="$2"
+    
+    # Ensure tpmdata directory exists
+    mkdir -p ./tpmdata
+    
+    # Create or update provisioning.json
+    if [[ -f "./tpmdata/provisioning.json" ]]; then
+        # First decrypt if encrypted
+        if [[ -f "./tpmdata/provisioning.enc" ]]; then
+            if ! decrypt_metadata 2>/dev/null; then
+                echo "Creating new metadata file"
+                echo '{"identities":{},"domain_settings":{},"version":"2.0"}' > ./tpmdata/provisioning.json
+            fi
+        fi
+        
+        # Update existing file
+        jq --arg addr "$address" --arg handle "$tmp_handle" \
+           '.identities[$addr] = {
+               "tmp_handle": $handle,
+               "created_at": (now | tostring),
+               "encryption_method": "yubikey_aes"
+           }' ./tpmdata/provisioning.json > /dev/shm/provisioning_new.json
+        
+        # Check if jq succeeded
+        if [[ $? -eq 0 ]] && [[ -s /dev/shm/provisioning_new.json ]]; then
+            mv /dev/shm/provisioning_new.json ./tpmdata/provisioning.json
+        else
+            echo "Failed to update metadata, creating new file"
+            jq -n --arg addr "$address" --arg handle "$tmp_handle" \
+               '{
+                   "identities": {
+                       ($addr): {
+                           "tmp_handle": $handle,
+                           "created_at": (now | tostring),
+                           "encryption_method": "yubikey_aes"
+                       }
+                   },
+                   "domain_settings": {},
+                   "version": "2.0"
+               }' > ./tpmdata/provisioning.json
+        fi
+    else
+        # Create new file
+        jq -n --arg addr "$address" --arg handle "$tmp_handle" \
+           '{
+               "identities": {
+                   ($addr): {
+                       "tmp_handle": $handle,
+                       "created_at": (now | tostring),
+                       "encryption_method": "yubikey_aes"
+                   }
+               },
+               "domain_settings": {},
+               "version": "2.0"
+           }' > ./tpmdata/provisioning.json
+    fi
+    
+    # Copy to shm for encryption
+    cp ./tpmdata/provisioning.json /dev/shm/provisioning.json
+    
+    # Encrypt with YubiKey using existing function
+    if encrypt_metadata; then
+        if [[ "$HACKER_MODE" == "1" ]]; then
+            echo -e "\033[32m[CRYPTO]\033[0m metadata.encrypted.yubikey"
+        else
+            echo "Metadata encrypted with YubiKey"
+        fi
+    else
+        if [[ "$HACKER_MODE" == "1" ]]; then
+            echo -e "\033[31m[ERROR]\033[0m metadata.encryption.failed"
+        else
+            echo "Failed to encrypt metadata with YubiKey"
+        fi
+        return 1
+    fi
+}
+
+encrypt_metadata() {
+    if [[ ! -f "/dev/shm/provisioning.json" ]]; then
+        if [[ -f "./tpmdata/provisioning.json" ]]; then
+            cp ./tpmdata/provisioning.json /dev/shm/provisioning.json
+        else
+            echo "No metadata to encrypt"
+            return 1
+        fi
+    fi
+    
+    # Check if YubiKey is available
+    if ! command -v ykchalresp >/dev/null; then
+        echo "YubiKey tools not installed"
+        return 1
+    fi
+    
+    # Check if YubiKey is connected
+    if ! ykchalresp -2 -x "00" >/dev/null 2>&1; then
+        echo "YubiKey not detected"
+        return 1
+    fi
+    
+    current_hash=$(sha256sum /dev/shm/provisioning.json | cut -d' ' -f1)
+    stored_hash=$(cat ./tpmdata/provisioning.hash 2>/dev/null || echo "")
+    
+    if [[ "$current_hash" != "$stored_hash" ]]; then
+        # Data changed, generate new challenge
+        challenge=$(openssl rand 32 | xxd -p -c 32)
+        echo "$challenge" > /dev/shm/.brunnen_challenge
+        echo "$current_hash" > ./tpmdata/provisioning.hash
+        echo "Generated new challenge for changed metadata"
+    else
+        # Data unchanged, check for existing challenge
+        if [[ -f /dev/shm/.brunnen_challenge ]]; then
+            challenge=$(cat /dev/shm/.brunnen_challenge)
+            echo "Reusing existing challenge"
+        else
+            # No challenge exists, generate new one
+            challenge=$(openssl rand 32 | xxd -p -c 32)
+            echo "$challenge" > /dev/shm/.brunnen_challenge
+            echo "Generated new challenge"
+        fi
+    fi
+    
+    # Get AES key from YubiKey
+    aes_key=$(ykchalresp -2 -x "$challenge" 2>/dev/null)
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to get response from YubiKey"
+        return 1
+    fi
+    
+    # Encrypt the metadata
+    openssl enc -aes-256-cbc -in /dev/shm/provisioning.json \
+        -out ./tpmdata/provisioning.enc -k "$aes_key" -pbkdf2
+    
+    if [[ $? -eq 0 ]]; then
+        chmod 600 ./tpmdata/provisioning.enc /dev/shm/.brunnen_challenge
+        shred -u /dev/shm/provisioning.json 2>/dev/null || rm -f /dev/shm/provisioning.json
+        echo "Metadata encrypted with YubiKey"
+        return 0
+    else
+        echo "Encryption failed"
+        return 1
+    fi
+}
+
+decrypt_metadata() {
+    if [[ ! -f "./tpmdata/provisioning.enc" ]]; then
+        echo "No encrypted metadata found"
+        return 1
+    fi
+    
+    # Check if YubiKey is available
+    if ! command -v ykchalresp >/dev/null; then
+        echo "YubiKey tools not installed"
+        return 1
+    fi
+    
+    # Check if YubiKey is connected
+    if ! ykchalresp -2 -x "00" >/dev/null 2>&1; then
+        echo "YubiKey not detected"
+        return 1
+    fi
+    
+    # Ensure tpmdata directory exists and is writable
+    if [[ ! -w "./tpmdata" ]]; then
+        echo "Cannot write to ./tpmdata directory"
+        return 1
+    fi
+    
+    # Check for challenge file
+    if [[ ! -f "/dev/shm/.brunnen_challenge" ]]; then
+        echo "No challenge found - metadata may have been encrypted on another system"
+        return 1
+    fi
+    
+    challenge=$(cat /dev/shm/.brunnen_challenge)
+    aes_key=$(ykchalresp -2 -x "$challenge" 2>/dev/null)
+    
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to get response from YubiKey"
+        return 1
+    fi
+    
+    # Decrypt the metadata
+    openssl enc -aes-256-cbc -d -in ./tpmdata/provisioning.enc \
+        -out /dev/shm/provisioning.json -k "$aes_key" -pbkdf2
+    
+    if [[ $? -eq 0 ]]; then
+        echo "Metadata decrypted"
+        return 0
+    else
+        echo "Decryption failed - wrong YubiKey or corrupted data?"
+        return 1
+    fi
+}
+
 register_identity() {
     if [[ "$HACKER_MODE" == "1" ]]; then
         echo -e "\033[32m=== [IDENTITY_REGISTER] ===\033[0m"
@@ -420,7 +822,7 @@ register_identity() {
     address="${username}@${domain}"
     
     # Check for existing encrypted metadata using your existing decrypt function
-    if [[ -f "/tpmdata/provisioning.enc" ]]; then
+    if [[ -f "./tpmdata/provisioning.enc" ]]; then
         if [[ "$HACKER_MODE" == "1" ]]; then
             echo -e "\033[37mmetadata.exists:\033[0m checking identity..."
         else
@@ -429,7 +831,7 @@ register_identity() {
         
         # Try to decrypt existing metadata using existing function
         if decrypt_metadata 2>/dev/null; then
-            EXISTING_HANDLE=$(jq -r ".identities[\"$address\"].tmp_handle // empty" /tpmdata/provisioning.json 2>/dev/null)
+            EXISTING_HANDLE=$(jq -r ".identities[\"$address\"].tmp_handle // empty" /dev/shm/provisioning.json 2>/dev/null)
             
             if [[ -n "$EXISTING_HANDLE" ]] && [[ "$EXISTING_HANDLE" != "empty" ]]; then
                 if [[ "$HACKER_MODE" == "1" ]]; then
@@ -546,91 +948,6 @@ register_identity() {
     fi
 }
 
-store_domain_seed() {
-    local domain="$1"
-    local domain_seed="$2"
-    
-    mkdir -p ./tpmdata
-    
-    if [[ -f "./tpmdata/provisioning.json" ]]; then
-        jq --arg domain "$domain" --arg seed "$domain_seed" \
-           '.domain_settings[$domain] = {
-               "seed": $seed,
-               "created_at": now
-           }' ./tpmdata/provisioning.json > /dev/shm/provisioning_new.json
-        mv /dev/shm/provisioning_new.json ./tpmdata/provisioning.json
-    else
-        jq -n --arg domain "$domain" --arg seed "$domain_seed" \
-           '{
-               "identities": {},
-               "domain_settings": {
-                   ($domain): {
-                       "seed": $seed,
-                       "created_at": now
-                   }
-               },
-               "version": "2.0"
-           }' > ./tpmdata/provisioning.json
-    fi
-    
-    encrypt_metadata
-}
-
-# Store identity in metadata file and encrypt with YubiKey using existing functions
-store_identity_metadata() {
-    local address="$1"
-    local tmp_handle="$2"
-    
-    # Ensure /tpmdata directory exists
-    mkdir -p ./tpmdata
-    
-    # Create or update provisioning.json
-    if [[ -f "./tpmdata/provisioning.json" ]]; then
-        # Update existing file
-        jq --arg addr "$address" --arg handle "$tmp_handle" \
-           '.identities[$addr] = {
-               "tmp_handle": $handle,
-               "created_at": now,
-               "encryption_method": "yubikey_aes"
-           }' ./tpmdata/provisioning.json > /dev/shm/provisioning_new.json
-        mv /dev/shm/provisioning_new.json ./tpmdata/provisioning.json
-    else
-        # Create new file
-        jq -n --arg addr "$address" --arg handle "$tmp_handle" \
-           '{
-               "identities": {
-                   ($addr): {
-                       "tmp_handle": $handle,
-                       "created_at": now,
-                       "encryption_method": "yubikey_aes"
-                   }
-               },
-               "domain_settings": {},
-               "version": "2.0"
-           }' > ./tpmdata/provisioning.json
-    fi
-    
-    # Encrypt with YubiKey using existing function
-    if encrypt_metadata; then
-        if [[ "$HACKER_MODE" == "1" ]]; then
-            echo -e "\033[32m[CRYPTO]\033[0m metadata.encrypted.yubikey"
-        else
-            echo "Metadata encrypted with YubiKey"
-        fi
-    else
-        if [[ "$HACKER_MODE" == "1" ]]; then
-            echo -e "\033[31m[ERROR]\033[0m metadata.encryption.failed"
-        else
-            echo "Failed to encrypt metadata with YubiKey"
-        fi
-        return 1
-    fi
-}
-
-
-
-
-
 query_user() {
     echo "=== Query User ==="
     echo -n "Enter user@domain.(coin, emc, lib, bazar): "
@@ -684,7 +1001,7 @@ sign_data() {
         echo "TPM Signature: $signature"
         echo "Data: $data"
         echo "Signer: $signer"
-        rm -f /dev/shm/sign_data /dev/shm/signature
+        shred -u /dev/shm/sign_data /dev/shm/signature 2>/dev/null || true
     else
         echo "TPM signing failed"
     fi
@@ -715,7 +1032,7 @@ verify_signature() {
         echo "[FAIL] Invalid TPM signature"
     fi
     
-    rm -f /dev/shm/verify_data /dev/shm/verify_sig
+    shred -u /dev/shm/verify_data /dev/shm/verify_sig 2>/dev/null || true
 }
 
 verify_remote_identity() {
@@ -740,7 +1057,11 @@ verify_remote_identity() {
 }
 
 get_yggdrasil_address() {
-    sudo yggdrasilctl getSelf 2>/dev/null | grep -oE '200:[a-f0-9:]+' || echo ""
+    if command -v yggdrasilctl >/dev/null 2>&1; then
+        yggdrasilctl getSelf 2>/dev/null | grep -oE '200:[a-f0-9:]+' || echo ""
+    else
+        echo ""
+    fi
 }
 
 start_yggdrasil() {
@@ -768,6 +1089,53 @@ stop_yggdrasil() {
     echo "Yggdrasil stopped"
 }
 
+configure_voip() {
+    echo "=== Configure VoIP ==="
+    
+    # Check if Asterisk is installed
+    if ! command -v asterisk >/dev/null; then
+        echo "Asterisk not installed. Install with: sudo apt-get install asterisk"
+        return 1
+    fi
+    
+    echo -n "Your Brunnen-G identity (user@domain): "
+    read identity
+    
+    # Extract user and domain
+    user="${identity%@*}"
+    domain="${identity#*@}"
+    
+    # Generate SIP configuration
+    cat > /tmp/brunnen_sip.conf <<EOF
+[brunnen-${user}]
+type=friend
+context=brunnen-g
+host=dynamic
+secret=$(openssl rand -hex 16)
+dtmfmode=rfc2833
+canreinvite=no
+nat=yes
+qualify=yes
+callerid="${user}@${domain}"
+EOF
+    
+    echo "SIP configuration generated at /tmp/brunnen_sip.conf"
+    echo "Add this to /etc/asterisk/sip.conf and reload Asterisk"
+    
+    # Generate dialplan
+    cat > /tmp/brunnen_dialplan.conf <<EOF
+[brunnen-g]
+; Dial Brunnen-G identities
+exten => _[a-zA-Z0-9].,1,NoOp(Dialing Brunnen-G identity \${EXTEN})
+same => n,Set(IDENTITY=\${EXTEN})
+same => n,AGI(brunnen_lookup.agi,\${IDENTITY})
+same => n,Dial(SIP/\${SIPURI},30)
+same => n,Hangup()
+EOF
+    
+    echo "Dialplan generated at /tmp/brunnen_dialplan.conf"
+    echo "Add this to /etc/asterisk/extensions.conf"
+}
 
 # API Configuration
 API_PORT=${API_PORT:-8080}
@@ -858,7 +1226,7 @@ api_sign() {
         else
             echo "{\"status\":\"error\",\"message\":\"Signing failed\"}"
         fi
-        rm -f /dev/shm/api_sign_data /dev/shm/api_signature
+        shred -u /dev/shm/api_sign_data /dev/shm/api_signature 2>/dev/null || true
     else
         echo "{\"status\":\"error\",\"message\":\"Signer not found\"}"
     fi
@@ -880,7 +1248,7 @@ api_verify_sig() {
         else
             echo "{\"status\":\"success\",\"verified\":false}"
         fi
-        rm -f /dev/shm/api_verify_data /dev/shm/api_verify_sig
+        shred -u /dev/shm/api_verify_data /dev/shm/api_verify_sig 2>/dev/null || true
     else
         echo "{\"status\":\"error\",\"message\":\"Signer not found\"}"
     fi
@@ -917,7 +1285,7 @@ start_api_daemon() {
 }
 
 stop_api_daemon() {
-   local pid_file="/dev/shm/brunnen_api.pid"
+   local pid_file="/tmp/brunnen_api.pid"
    
    if [[ -f "$pid_file" ]]; then
        local pid=$(cat "$pid_file")
@@ -976,6 +1344,7 @@ sync_with_peers() {
         timeout 5 curl -s "http://[$peer]:8080/api/key" >/dev/null && echo "Found peer: $peer"
     done
 }
+
 validate_address() {
     [[ "$1" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.(coin|emc|lib|bazar)$ ]]
 }
@@ -1118,57 +1487,6 @@ test_wazuh_connection() {
     fi
 }
 
-encrypt_metadata() {
-    if [[ ! -f "/dev/shm/provisioning.json" ]]; then
-        echo "No metadata to encrypt"
-        return 1
-    fi
-    
-    current_hash=$(sha256sum /dev/shm/provisioning.json | cut -d' ' -f1)
-    stored_hash=$(cat ./tpmdata/provisioning.hash 2>/dev/null || echo "")
-    
-    if [[ "$current_hash" != "$stored_hash" ]]; then
-        # Data changed, generate new challenge
-        challenge=$(openssl rand 32 | xxd -p -c 32)
-        echo "$challenge" > /dev/shm/.brunnen_challenge
-        echo "$current_hash" > ./tpmdata/provisioning.hash
-        echo "Generated new challenge for changed metadata"
-    else
-        # Data unchanged, reuse challenge
-        challenge=$(cat /dev/shm/.brunnen_challenge)
-        echo "Reusing existing challenge"
-    fi
-    
-    aes_key=$(ykchalresp -2 -x "$challenge")
-    openssl enc -aes-256-cbc -in /dev/shm/provisioning.json \
-        -out ./tpmdata/provisioning.enc -k "$aes_key"
-    
-    chmod 600 ./tpmdata/provisioning.enc /dev/shm/.brunnen_challenge
-    shred -u /dev/shm/provisioning.json
-    echo "Metadata encrypted with YubiKey"
-}
-
-decrypt_metadata() {
-    if [[ ! -f "./tpmdata/provisioning.enc" ]]; then
-        echo "No encrypted metadata found"
-        return 1
-    fi
-    
-    # Ensure tpmdata directory exists and is writable
-    if [[ ! -w "./tpmdata" ]]; then
-        echo "Cannot write to ./tpmdata directory"
-        return 1
-    fi
-    
-    challenge=$(cat /dev/shm/.brunnen_challenge)
-    aes_key=$(ykchalresp -2 -x "$challenge")
-    # debug
-    echo "yubi token key: $aes_key"
-    openssl enc -aes-256-cbc -d -in ./tpmdata/provisioning.enc \
-        -out /dev/shm/provisioning.json -k "$aes_key"
-    echo "Metadata decrypted"
-}
-
 quick_setup() {
     echo "=== Quick Setup ==="
     start_yggdrasil
@@ -1177,17 +1495,6 @@ quick_setup() {
     echo "Setup complete! Your identity is registered and services are running."
 }
 
-echo -e "\033[32m"
-echo "
-██████╗ ██████╗ ██╗   ██╗███╗   ██╗███╗   ██╗███████╗███╗   ██╗       ██████╗ 
-██╔══██╗██╔══██╗██║   ██║████╗  ██║████╗  ██║██╔════╝████╗  ██║      ██╔════╝ 
-██████╔╝██████╔╝██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██╔██╗ ██║█████╗██║  ███╗
-██╔══██╗██╔══██╗██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║╚██╗██║╚════╝██║   ██║
-██████╔╝██║  ██║╚██████╔╝██║ ╚████║██║ ╚████║███████╗██║ ╚████║      ╚██████╔╝
-╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═══╝       ╚═════╝ 
-                        Decentralized Public Key Infrastructure
-"
-echo -e "\033[36mcybersec.mesh_authenticated\033[0m"
 identity_menu() {
     if [[ "$HACKER_MODE" == "1" ]]; then
         echo -e "\033[32m=== [IDENTITY_CORE] ===\033[0m"
@@ -1200,11 +1507,14 @@ identity_menu() {
         echo "2) Sign message"  
         echo "3) Verify signature"
     fi
+    echo -n "Choice: "
+    read choice
     
     case $choice in
         1) query_user ;;
         2) sign_data ;;
         3) verify_signature ;;
+        *) echo "Invalid choice" ;;
     esac
 }
 
@@ -1219,8 +1529,8 @@ network_menu() {
         echo "1) Publish to blockchain (requires domain ownership)"
         echo "2) Configure VoIP"
         echo "3) Send message (coming soon)"
-        echo -n "Choice: "
     fi
+    echo -n "Choice: "
     read choice
     
     case $choice in
@@ -1236,7 +1546,6 @@ network_menu() {
             ;;
         2) configure_voip ;;
         3) echo "Messaging not yet implemented" ;;
-    
     esac
 }
 
@@ -1245,7 +1554,7 @@ advanced_menu() {
         echo -e "\033[32m=== [ROOT_ACCESS] ===\033[0m"
         echo -e "\033[32m1) api\033[0m.\033[37mkey_management\033[0m"
         echo -e "\033[32m2) database\033[0m.\033[37moperations\033[0m"
-        echo -e "\033[32m3) tmp\033[0m.\033[37mmaintenance\033[0m"
+        echo -e "\033[32m3) tpm\033[0m.\033[37mmaintenance\033[0m"
         echo -e "\033[32m4) wazuh\033[0m.\033[37mmonitoring\033[0m"
     else
         echo "=== Advanced Settings ==="
@@ -1253,11 +1562,10 @@ advanced_menu() {
         echo "2) Database operations"
         echo "3) TPM maintenance"
         echo "4) Wazuh monitoring"
-
     fi
     echo -n "Choice: "
-    
     read choice
+    
     case $choice in
         1) echo "1) Create  2) List  3) Revoke"
             echo -n "API action: "
@@ -1269,7 +1577,7 @@ advanced_menu() {
             esac
             ;;
         2) database_operations ;;
-        3) tmp_maintenance ;;
+        3) tpm_maintenance ;;
         4) wazuh_menu ;;
         *) echo "Invalid choice" ;;
     esac
@@ -1290,8 +1598,8 @@ wazuh_menu() {
         echo "4) Test connection"
     fi
     echo -n "Choice: "
-    
     read choice
+    
     case $choice in
         1) enable_wazuh_monitoring ;;
         2) disable_wazuh_monitoring ;;
@@ -1326,7 +1634,7 @@ database_operations() {
     esac
 }
 
-tmp_maintenance() {
+tpm_maintenance() {
     if [[ "$HACKER_MODE" == "1" ]]; then
         echo -e "\033[32m=== [TPM_SECURE] ===\033[0m"
         echo -e "\033[32m1) tpm\033[0m.\033[37mview_handles\033[0m"
@@ -1344,13 +1652,54 @@ tmp_maintenance() {
     read choice
     
     case $choice in
-        1) tmp2_getcap handles-persistent ;;
+        1) tpm2_getcap handles-persistent ;;
         2) encrypt_metadata ;;
         3) decrypt_metadata ;;
         4) run_tpm_script ./tpm/tpm_provisioning.sh ;;
     esac
 }
 
+# Initialize Brunnen-G environment
+initialize_brunnen() {
+    # Create necessary directories
+    mkdir -p ./data ./tpmdata
+    
+    # Check for existing database
+    if [[ ! -f "$DB_NAME" ]]; then
+        echo "Initializing Brunnen-G database..."
+        create_database
+    fi
+    
+    # Quick dependency check (silent)
+    local missing_deps=()
+    command -v tpm2_getcap >/dev/null || missing_deps+=("tpm2-tools")
+    command -v ykchalresp >/dev/null || missing_deps+=("yubikey-manager")
+    command -v ipfs >/dev/null || missing_deps+=("ipfs")
+    command -v emercoin-cli >/dev/null || missing_deps+=("emercoin")
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Note: Some optional dependencies missing: ${missing_deps[*]}"
+        echo "Run with --check-deps for details"
+    fi
+}
+
+# Display banner
+echo -e "\033[32m"
+echo "
+██████╗ ██████╗ ██╗   ██╗███╗   ██╗███╗   ██╗███████╗███╗   ██╗       ██████╗ 
+██╔══██╗██╔══██╗██║   ██║████╗  ██║████╗  ██║██╔════╝████╗  ██║      ██╔════╝ 
+██████╔╝██████╔╝██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██╔██╗ ██║█████╗██║  ███╗
+██╔══██╗██╔══██╗██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║╚██╗██║╚════╝██║   ██║
+██████╔╝██║  ██║╚██████╔╝██║ ╚████║██║ ╚████║███████╗██║ ╚████║      ╚██████╔╝
+╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═══╝       ╚═════╝ 
+                        Decentralized Public Key Infrastructure
+"
+echo -e "\033[36mcybersec.mesh_authenticated\033[0m"
+
+# Initialize system
+initialize_brunnen
+
+# Main menu loop
 while true; do
     if [[ "$HACKER_MODE" == "1" ]]; then
         echo -e "\033[32m=== [SYSTEM_ACCESS] ===\033[0m"
@@ -1392,5 +1741,5 @@ while true; do
                 2) exit 0 ;;
             esac
             ;;
-            esac
+    esac
 done

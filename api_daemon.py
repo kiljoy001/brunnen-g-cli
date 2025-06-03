@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Brunnen-G API Daemon - Fixed Version
+Brunnen-G API Daemon with AES Encryption and TPM Integrity
 """
 import os
 import json
@@ -10,460 +10,686 @@ import subprocess
 import sqlite3
 import time
 import logging
-import uuid
 import re
-import getpass
-import glob
-import sys, shutil
+import asyncio
+import aiohttp
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-from systemd.journal import JournalHandler
+from aiohttp import web
+from threading import Lock
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
+import base64
+import signal
+import sys
+import atexit
+
 
 API_PORT = 8080
 DB_DIR = os.environ.get('BRUNNEN_DB_DIR', './data')
-DB_FILES = glob.glob(os.path.join(DB_DIR, "*.db"))
-if not DB_FILES:
-    logging.error("No database found. Run shell script first.")
-    sys.exit(1)
-DB_NAME = DB_FILES[0]
-LOG_FILE = "/var/log/brunnen_api.log"
-MAX_PAYLOAD_SIZE = 1048576  # 1MB
+DB_NAME = os.path.join(DB_DIR, 'brunnen.db')
+MAX_PAYLOAD_SIZE = 1048576
 ADDRESS_REGEX = re.compile(r'^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.(coin|emc|lib|bazar)$')
+DOMAIN_NAME = os.environ.get('BRUNNEN_DOMAIN', '')  # Set via environment
+TPM_HANDLE = os.environ.get('BRUNNEN_TPM_HANDLE', '0x81000000')
+INTEGRITY_CHECK_INTERVAL = 3600  # 1 hour
 
-class SecurityError(Exception): pass
+def signal_handler(sig, frame):
+    """Handle shutdown signals gracefully"""
+    logging.info(f"Received signal {sig}, shutting down...")
+    
+    # Clean up resources
+    if os.path.exists(HMAC_KEY_FILE):
+        os.unlink(HMAC_KEY_FILE)
+    
+    # Remove PID file
+    pid_file = "/tmp/brunnen_api.pid"
+    if os.path.exists(pid_file):
+        os.unlink(pid_file)
+    
+    logging.info("API daemon shutdown complete")
+    sys.exit(0)
 
-def secure_subprocess(cmd_list, timeout=10, env_vars=None):
-    """Secure subprocess execution with validation"""
-    # Validate command exists and is executable
-    cmd_path = shutil.which(cmd_list[0])
-    if not cmd_path:
-        raise SecurityError(f"Command not found: {cmd_list[0]}")
-    
-    # Use explicit environment
-    safe_env = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
-    if env_vars:
-        safe_env.update(env_vars)
-    
-    return subprocess.run(
-        [cmd_path] + cmd_list[1:],
-        timeout=timeout,
-        env=safe_env,
-        capture_output=True,
-        text=True,
-        check=True
-    )
+def cleanup():
+    """Cleanup function for atexit"""
+    pid_file = "/tmp/brunnen_api.pid"
+    if os.path.exists(pid_file):
+        os.unlink(pid_file)
 
-def validate_inputs(data):
-    """Comprehensive input validation"""
-    if not isinstance(data, dict):
-        raise ValueError("Data must be dictionary")
-    
-    for key, value in data.items():
-        if not isinstance(key, str) or len(key) > 50:
-            raise ValueError(f"Invalid key: {key}")
-        
-        if isinstance(value, str):
-            if len(value) > 1024:
-                raise ValueError(f"Value too long for {key}")
-            # Check for injection patterns
-            if re.search(r'[;&|`$()]', value):
-                raise ValueError(f"Invalid characters in {key}")
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+atexit.register(cleanup)
 
-def decrypt_tpm_metadata():
-    """Decrypt TPM metadata if encrypted"""
-    if not os.path.exists("/tpmdata/provisioning.enc"):
-        return  # Not encrypted or doesn't exist
-    
-    if not os.path.exists("/tpmdata/.challenge"):
-        raise Exception("Challenge file missing")
-    
-    with open("/tpmdata/.challenge", 'r') as f:
-        challenge = f.read().strip()
-    
-    # Call YubiKey for decryption
-    result = secure_subprocess(['ykchalresp', '-2', '-x', challenge], 
-                          capture_output=True, text=True, check=True)
-    aes_key = result.stdout.strip()
-    
-    # Decrypt metadata
-    secure_subprocess([
-        'openssl', 'enc', '-aes-256-cbc', '-d',
-        '-in', '/tpmdata/provisioning.enc',
-        '-out', '/tpmdata/provisioning.json',
-        '-k', aes_key
-    ], check=True)
-
-# Authenticaion required decorator
-def require_auth(permissions=None):
-    def decorator(func):
-        def wrapper(self, *args, **kwargs):
-            api_key = self.headers.get('X-API-Key')
-            app_name, user_perms, rate_limit = self.authenticate_app(api_key)
-            
-            if not app_name:
-                self.send_error_response(401, "unauthorized", "Invalid API key")
-                return
-            
-            if permissions and not self.check_permission(user_perms, permissions):
-                self.send_error_response(403, "forbidden", f"{permissions} permission required")
-                return
-            
-            return func(self, app_name, *args, **kwargs)
-        return wrapper
-    return decorator
-
-# Ensure DB directory exists
 os.makedirs(DB_DIR, exist_ok=True)
 
-# Setup logging with fallback
-try:
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[
-            JournalHandler(SYSLOG_IDENTIFIER='brunnen-api'),
-            logging.StreamHandler()
-        ]
-    )
-except Exception as e:
-    logging.basicConfig(level=logging.INFO)
-    logging.warning(f"Could not create log file: {e}")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
 
-class RateLimiter:
-    def __init__(self, max_requests=60, window=60):
-        self.requests = {}
-        self.max_requests = max_requests
-        self.window = window
-        self.last_cleanup = time.time()
+class AESCrypto:
+    def __init__(self):
+        self.key = self._get_or_create_key()
     
-    def allow_request(self, key, limit=None):
-        now = time.time()
+    def _get_or_create_key(self):
+        key_file = os.path.join(DB_DIR, '.aes_key')
+        if os.path.exists(key_file):
+            with open(key_file, 'rb') as f:
+                return f.read()
+        else:
+            # Generate key via TPM if available
+            try:
+                proc = subprocess.run(['tpm2_getrandom', '32'], 
+                                    capture_output=True, timeout=5)
+                if proc.returncode == 0:
+                    key = proc.stdout
+                else:
+                    key = os.urandom(32)
+            except:
+                key = os.urandom(32)
+            
+            with open(key_file, 'wb') as f:
+                f.write(key)
+            os.chmod(key_file, 0o600)
+            return key
+    
+    def encrypt(self, plaintext):
+        if not plaintext:
+            return None
         
-        # Periodic cleanup every 5 minutes
-        if now - self.last_cleanup > 300:
-            self.clean_old_entries()
-            self.last_cleanup = now
+        # Generate random IV
+        iv = os.urandom(16)
         
-        if key not in self.requests:
-            self.requests[key] = []
+        # Pad plaintext
+        padder = padding.PKCS7(128).padder()
+        padded_data = padder.update(plaintext.encode()) + padder.finalize()
         
-        self.requests[key] = [t for t in self.requests[key] if now - t < self.window]
+        # Encrypt
+        cipher = Cipher(
+            algorithms.AES(self.key),
+            modes.CBC(iv),
+            backend=default_backend()
+        )
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
         
-        max_allowed = limit or self.max_requests
-        if len(self.requests[key]) >= max_allowed:
+        # Return IV + ciphertext
+        return base64.b64encode(iv + ciphertext).decode()
+    
+    def decrypt(self, ciphertext):
+        if not ciphertext:
+            return None
+        try:
+            # Decode
+            data = base64.b64decode(ciphertext)
+            
+            # Extract IV and ciphertext
+            iv = data[:16]
+            actual_ciphertext = data[16:]
+            
+            # Decrypt
+            cipher = Cipher(
+                algorithms.AES(self.key),
+                modes.CBC(iv),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            padded_plaintext = decryptor.update(actual_ciphertext) + decryptor.finalize()
+            
+            # Unpad
+            unpadder = padding.PKCS7(128).unpadder()
+            plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
+            
+            return plaintext.decode()
+        except Exception as e:
+            logging.error(f"Decryption error: {e}")
+            return None
+
+class MerkleTree:
+    @staticmethod
+    def hash_data(data):
+        return hashlib.sha256(data.encode()).hexdigest()
+    
+    @staticmethod
+    def calculate_merkle_root(leaves):
+        if not leaves:
+            return None
+        
+        # Hash all leaves
+        current_level = [MerkleTree.hash_data(leaf) for leaf in leaves]
+        
+        while len(current_level) > 1:
+            next_level = []
+            for i in range(0, len(current_level), 2):
+                if i + 1 < len(current_level):
+                    combined = current_level[i] + current_level[i + 1]
+                else:
+                    combined = current_level[i] + current_level[i]
+                next_level.append(hashlib.sha256(combined.encode()).hexdigest())
+            current_level = next_level
+        
+        return current_level[0]
+
+class DatabaseIntegrity:
+    def __init__(self, db_path, crypto):
+        self.db_path = db_path
+        self.crypto = crypto
+        self.lock = Lock()
+    
+    async def calculate_db_merkle(self):
+        leaves = []
+        async with aiosqlite.connect(self.db_path) as db:
+            # Get all PII data in deterministic order
+            async with db.execute("""
+                SELECT address, pubkey, ygg_pubkey, created_at 
+                FROM address_keys ORDER BY address
+            """) as cursor:
+                async for row in cursor:
+                    # Include encrypted values in merkle
+                    leaf = f"{row[0]}|{row[1]}|{row[2]}|{row[3]}"
+                    leaves.append(leaf)
+        
+        return MerkleTree.calculate_merkle_root(leaves)
+    
+    async def store_merkle_in_tpm(self, merkle_root):
+        try:
+            # Store in TPM NV memory
+            proc = await asyncio.create_subprocess_exec(
+                'tpm2_nvdefine', TPM_HANDLE, '-s', '32', '-a', 'ownerwrite|ownerread',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+            
+            # Write merkle root
+            proc = await asyncio.create_subprocess_exec(
+                'tpm2_nvwrite', TPM_HANDLE, '-i', '-',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate(input=merkle_root.encode())
+            
+            logging.info(f"Stored merkle root in TPM: {merkle_root[:16]}...")
+            return True
+        except Exception as e:
+            logging.error(f"TPM merkle storage failed: {e}")
+            # Fallback to file
+            with open(os.path.join(DB_DIR, '.merkle'), 'w') as f:
+                f.write(merkle_root)
             return False
-        
-        self.requests[key].append(now)
+    
+    async def verify_merkle_from_tpm(self, current_merkle):
+        try:
+            # Read from TPM
+            proc = await asyncio.create_subprocess_exec(
+                'tpm2_nvread', TPM_HANDLE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            stored_merkle = stdout.decode().strip()
+            
+            return stored_merkle == current_merkle
+        except:
+            # Fallback to file
+            try:
+                with open(os.path.join(DB_DIR, '.merkle'), 'r') as f:
+                    stored_merkle = f.read().strip()
+                return stored_merkle == current_merkle
+            except:
+                return True  # First run
+    
+    async def verify_integrity(self):
+        current_merkle = await self.calculate_db_merkle()
+        if not await self.verify_merkle_from_tpm(current_merkle):
+            logging.error("DATABASE INTEGRITY CHECK FAILED!")
+            return False
         return True
     
-    def clean_old_entries(self):
-        now = time.time()
-        for key in list(self.requests.keys()):
-            self.requests[key] = [t for t in self.requests[key] if now - t < self.window]
-            if not self.requests[key]:
-                del self.requests[key]
+    async def update_integrity(self):
+        merkle_root = await self.calculate_db_merkle()
+        await self.store_merkle_in_tpm(merkle_root)
 
-class APIHandler(BaseHTTPRequestHandler):
-    rate_limiter = RateLimiter()
-
-    def do_OPTIONS(self):
-        """Handle CORS preflight requests"""
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', 
-                         os.environ.get('CORS_ORIGIN', 'http://localhost:3000'))
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'X-API-Key, Content-Type, X-Request-ID')
-        self.send_header('Access-Control-Max-Age', '86400')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('X-Frame-Options', 'DENY')
-        self.end_headers()
-
-    def authenticate_app(self, api_key):
-        if not api_key:
-            return None, None, None
+class EconomicDefense:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.base_cost = 0.01
+        self.base_period = 2  # Base period in days (2 days)
+        self.lock = Lock()
         
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT app_name, api_key_hash, salt, permissions, rate_limit 
-                FROM api_keys
-            """)
-            
-            for row in cursor:
-                app_name, stored_hash, salt, permissions, rate_limit = row
-                # Constant-time comparison
-                test_hash = hashlib.pbkdf2_hmac('sha256', api_key.encode(), salt.encode(), 100000).hex()
-                if hmac.compare_digest(test_hash, stored_hash):
-                    # Update last_used
-                    cursor.execute("""
-                        UPDATE api_keys 
-                        SET last_used = ? 
-                        WHERE app_name = ?
-                    """, (int(time.time()), app_name))
-                    conn.commit()
-                    return app_name, permissions, rate_limit
-            
-            return None, None, None
-    
-    def check_permission(self, permissions, required):
-        if not permissions:
-            return False
-        perms = (permissions or '').split(',')
-        return required in perms or 'admin' in perms
-    
-    def sanitize_log_input(self, text):
-        # Remove newlines and control characters
-        return re.sub(r'[\x00-\x1f\x7f-\x9f\n\r]', '', str(text))[:100]
-    
-    def log_api_request(self, request_id, app_name, endpoint, method, status_code):
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.execute("""
-                INSERT INTO api_logs 
-                (request_id, timestamp, app_name, endpoint, method, status_code, ip_address)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                request_id,
-                int(time.time()),
-                app_name or 'anonymous',
-                self.sanitize_log_input(endpoint),
-                method,
-                status_code,
-                self.client_address[0]
-            ))
-    
-    def send_error_response(self, code, error_type, detail):
-        request_id = self.headers.get('X-Request-ID', str(uuid.uuid4()))
-        error = {
-            "type": f"/errors/{error_type}",
-            "title": self.responses.get(code, ['Unknown'])[0],
-            "status": code,
-            "detail": detail,
-            "instance": f"/logs/{request_id}"
-        }
-        self.send_json_response(code, error, request_id)
-    
-    def send_json_response(self, code, data, request_id=None):
-        response = json.dumps(data)
-        
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(response)))
-        self.send_header('X-Request-ID', request_id or str(uuid.uuid4()))
-        self.send_header('X-Content-Type-Options', 'nosniff') 
-        self.send_header('X-Frame-Options', 'DENY')  
-
-        # Configurable CORS
-        allowed_origin = os.environ.get('CORS_ORIGIN', 'http://localhost:3000')
-        self.send_header('Access-Control-Allow-Origin', allowed_origin)
-        
-        self.end_headers()
-        self.wfile.write(response.encode())
-    
-    def validate_address(self, address):
-        return bool(ADDRESS_REGEX.match(address))
-    
-    def query_user(self, address):
+    async def get_current_block_height(self):
         try:
-            with sqlite3.connect(DB_NAME) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT pubkey FROM address_keys WHERE address = ?", (address,))
-                result = cursor.fetchone()
-                
-                if result:
-                    return {"status": "success", "address": address, "pubkey": result[0]}
-                else:
-                    return {"status": "error", "message": "User not found"}
-        except Exception as e:
-            logging.error(f"Database error: {e}")
-            return {"status": "error", "message": "Internal server error"}
+            proc = await asyncio.create_subprocess_exec(
+                'emercoin-cli', 'getblockcount',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                return int(stdout.decode().strip())
+        except:
+            pass
+        return 0
     
-    @require_auth('read')
-    def handle_query(self, app_name, parsed, request_id):
-        params = parse_qs(parsed.query)
-        address = params.get('address', [''])[0]
-
-        if not self.validate_address(address):
-            self.send_error_response(400, "invalid_address", "Invalid address format")
-            return
-
-        result = self.query_user(address)
-        status = 200 if result.get('status') == 'success' else 404
-        self.send_json_response(status, result, request_id)
-
-    @require_auth('admin') 
-    def handle_metrics(self, app_name, request_id):
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) as total_requests,
-                       COUNT(DISTINCT app_name) as unique_apps,
-                       COUNT(DISTINCT ip_address) as unique_ips
-                FROM api_logs WHERE timestamp > ?
-            """, (int(time.time()) - 3600,))
-            metrics = cursor.fetchone()
-
-        self.send_json_response(200, {
-            "requests_last_hour": metrics[0],
-            "active_apps": metrics[1], 
-            "unique_ips": metrics[2]
-        }, request_id)
-
-    def handle_health(self, request_id):
-        # Public endpoint
-        self.send_json_response(200, {
-            "status": "healthy",
-            "version": "1.0.0", 
-            "timestamp": int(time.time())
-        }, request_id)
-
-    def do_GET(self):
-        request_id = str(uuid.uuid4())
-        parsed = urlparse(self.path)
-
-        if parsed.path.startswith('/api/v1/'):
-            endpoint = parsed.path[8:]
-
-            if endpoint == 'query':
-                self.handle_query(parsed, request_id)
-            elif parsed.path == '/':
-                try:
-                    html_path = os.path.join(os.path.dirname(__file__), 'web', 'brunnen-g.html')
-                    with open(html_path, 'r') as f:
-                        content = f.read()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/html')
-                    self.send_header('Content-Length', str(len(content)))
-                    self.end_headers()
-                    self.wfile.write(content.encode())
-                    self.log_api_request(request_id, None, parsed.path, 'GET', 200)
-                except FileNotFoundError:
-                    self.send_error_response(404, "web_interface_not_found", "Web interface not available")
-            elif endpoint == 'health':
-                self.handle_health(request_id)
-            elif endpoint == 'metrics':
-                self.handle_metrics(request_id)
-            else:
-                self.send_error_response(404, "endpoint_not_found", f"Endpoint {endpoint} not found")
-
-    def do_POST(self):
-        request_id = str(uuid.uuid4())
-        parsed = urlparse(self.path)
-
-        # Size limit
-        content_length = int(self.headers.get('Content-Length', 0))
-        if content_length > MAX_PAYLOAD_SIZE:
-            self.send_error_response(413, "payload_too_large", 
-                               f"Maximum payload size is {MAX_PAYLOAD_SIZE} bytes")
-            return
-    
-        # Extract API key
-        api_key = self.headers.get('X-API-Key')
-        app_name, permissions, rate_limit = self.authenticate_app(api_key)
-
-        # Rate limiting
-        if app_name and not self.rate_limiter.allow_request(app_name, rate_limit):
-            self.send_error_response(429, "rate_limit_exceeded", 
-                                   f"Rate limit of {rate_limit} requests/minute exceeded")
-            self.log_api_request(request_id, app_name, parsed.path, 'POST', 429)
-            return
-
-        # Read and parse body
-        body = self.rfile.read(content_length).decode()
-
+    async def get_risk_record(self, domain, ygg_pubkey):
+        risk_key = f"risk:{domain}:{ygg_pubkey}"
         try:
-            data = json.loads(body) if body else {}
-
-            # Input length validation
-            for key, value in data.items():
-                if isinstance(value, str) and len(value) > 1024:
-                    self.send_error_response(400, "field_too_long", 
-                                           f"Field {key} exceeds maximum length of 1024")
-                    return
-
-        except json.JSONDecodeError:
-            self.send_error_response(400, "invalid_json", "Request body must be valid JSON")
-            return
-        if parsed.path == '/api/v1/admin/keys' and self.check_permission(permissions, 'admin'):
-            # Admin endpoint to manage API keys
-            action = data.get('action')
-
-            if action == 'create':
-                new_app_name = data.get('app_name')
-                new_permissions = data.get('permissions', 'read')
-
-                if not new_app_name:
-                    self.send_error_response(400, "missing_app_name", 
-                                           "app_name required")
-                    return
-
-                api_key, salt, key_hash = generate_api_key()
-
-                try:
-                    with sqlite3.connect(DB_NAME) as conn:
-                        conn.execute("""
-                            INSERT INTO api_keys 
-                            (app_name, api_key_hash, salt, permissions, created_at)
-                            VALUES (?, ?, ?, ?, ?)
-                        """, (new_app_name, key_hash, salt, new_permissions, int(time.time())))
-
-                    self.send_json_response(200, {
-                        "status": "success",
-                        "app_name": new_app_name,
-                        "api_key": api_key,
-                        "message": "Save this key - it cannot be retrieved later"
-                    }, request_id)
-                except sqlite3.IntegrityError:
-                    self.send_error_response(409, "app_exists", 
-                                           "App name already exists")
-
-            elif action == 'revoke':
-                revoke_app_name = data.get('app_name')
-
-                with sqlite3.connect(DB_NAME) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("DELETE FROM api_keys WHERE app_name = ?", 
-                                 (revoke_app_name,))
-
-                    if cursor.rowcount > 0:
-                        self.send_json_response(200, {
-                            "status": "success",
-                            "message": f"Revoked key for {revoke_app_name}"
-                        }, request_id)
-                    else:
-                        self.send_error_response(404, "app_not_found", 
-                                               "App name not found")
-            else:
-                self.send_error_response(400, "invalid_action", 
-                                       "action must be 'create' or 'revoke'")
-
-            self.log_api_request(request_id, app_name, parsed.path, 'POST', 200)
-
+            proc = await asyncio.create_subprocess_exec(
+                'emercoin-cli', 'name_show', risk_key,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                data = json.loads(stdout.decode())
+                return json.loads(data.get('value', '{}'))
+        except:
+            pass
+        return None
+    
+    async def get_all_risk_records_for_ygg(self, ygg_pubkey):
+        all_records = []
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'emercoin-cli', 'name_list', 'risk:',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                names = json.loads(stdout.decode())
+                for name_data in names:
+                    name = name_data.get('name', '')
+                    if ygg_pubkey in name:
+                        try:
+                            value = json.loads(name_data.get('value', '{}'))
+                            all_records.append(value)
+                        except:
+                            pass
+        except:
+            pass
+        return all_records
+    
+    async def calculate_registration_cost(self, domain, ygg_pubkey):
+        all_records = await self.get_all_risk_records_for_ygg(ygg_pubkey)
+        domains_count = len(all_records)
+        total_attempts = sum(record.get('attempts', 0) for record in all_records)
+        exponent = total_attempts + domains_count
+        return self.base_cost * (2 ** exponent)
+    
+    async def calculate_expiry_days(self, domain, ygg_pubkey):
+        all_records = await self.get_all_risk_records_for_ygg(ygg_pubkey)
+        domains_count = len(all_records)
+        total_attempts = sum(record.get('attempts', 0) for record in all_records)
+        exponent = total_attempts + domains_count
+        return min(self.base_period * (2 ** exponent), 365 * 100)  # Cap at 100 years
+    
+    async def update_risk_record(self, domain, ygg_pubkey, username):
+        risk_key = f"risk:{domain}:{ygg_pubkey}"
+        current_height = await self.get_current_block_height()
+        
+        record = await self.get_risk_record(domain, ygg_pubkey)
+        
+        if record:
+            record_data = {
+                "attempts": record.get('attempts', 0) + 1,
+                "user": username,
+                "last_attempt_block": current_height
+            }
         else:
-            self.send_error_response(404, "endpoint_not_found", 
-                                   f"Endpoint {parsed.path} not found")
-            self.log_api_request(request_id, app_name, parsed.path, 'POST', 404)
+            record_data = {
+                "attempts": 1,
+                "user": username,
+                "last_attempt_block": current_height
+            }
+        
+        expiry_days = await self.calculate_expiry_days(domain, ygg_pubkey)
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'emercoin-cli', 'name_update' if record else 'name_new',
+                risk_key, json.dumps(record_data), str(expiry_days),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            return proc.returncode == 0
+        except:
+            return False
+    
+    async def get_domain_owner_address(self, domain):
+        # Check database first
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT owner_address FROM domain_settings WHERE domain = ?", 
+                (domain,)
+            ) as cursor:
+                result = await cursor.fetchone()
+                if result and result[0]:
+                    return result[0]
+        
+        # Fall back to blockchain query
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'emercoin-cli', 'name_show', f'dns:{domain}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                domain_data = json.loads(stdout.decode())
+                owner_address = domain_data.get('address')
+                
+                # Cache in database
+                if owner_address:
+                    async with aiosqlite.connect(self.db_path) as db:
+                        await db.execute("""
+                            UPDATE domain_settings 
+                            SET owner_address = ?, verified_at = ?
+                            WHERE domain = ?
+                        """, (owner_address, int(time.time()), domain))
+                        await db.commit()
+                
+                return owner_address
+        except:
+            pass
+        return None
+    
+    async def verify_domain_payment(self, domain, amount, tx_hash):
+        owner_address = await self.get_domain_owner_address(domain)
+        if not owner_address:
+            return False
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'emercoin-cli', 'gettransaction', tx_hash,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                tx_data = json.loads(stdout.decode())
+                return (tx_data.get('amount', 0) >= amount and 
+                       owner_address in str(tx_data.get('details', [])))
+        except:
+            pass
+        return False
 
+async def setup_database():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS api_keys (
+                app_name TEXT PRIMARY KEY,
+                api_key_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                permissions TEXT DEFAULT 'read',
+                created_at INTEGER
+            );
+            
+            CREATE TABLE IF NOT EXISTS address_keys (
+                address TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                ygg_pubkey TEXT,
+                created_at INTEGER
+            );
+            
+            CREATE TABLE IF NOT EXISTS domain_settings (
+                domain TEXT PRIMARY KEY,
+                owner_address TEXT,
+                dnd_mode BOOLEAN DEFAULT 0,
+                income_earned REAL DEFAULT 0,
+                pending_updates INTEGER DEFAULT 0,
+                last_blockchain_post INTEGER,
+                verified_at INTEGER
+            );
+            
+            CREATE TABLE IF NOT EXISTS integrity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                merkle_root TEXT,
+                verified BOOLEAN
+            );
+        """)
+        await db.commit()
 
-def generate_api_key():
-    """Generate secure API key with salt"""
-    api_key = os.urandom(32).hex()
-    salt = os.urandom(16).hex()
-    key_hash = hashlib.pbkdf2_hmac('sha256', api_key.encode(), salt.encode(), 100000).hex()
-    return api_key, salt, key_hash
+async def verify_domain_ownership():
+    if not DOMAIN_NAME:
+        logging.error("BRUNNEN_DOMAIN environment variable not set!")
+        return False
+    
+    # Use semaphore to prevent concurrent verification
+    async with domain_verification_lock:
+        try:
+            # Check if already verified recently
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute(
+                    "SELECT owner_address, verified_at FROM domain_settings WHERE domain = ?",
+                    (DOMAIN_NAME,)
+                ) as cursor:
+                    result = await cursor.fetchone()
+                    if result and result[1] and (time.time() - result[1] < 86400):  # 24 hours
+                        logging.info(f"Domain already verified: {DOMAIN_NAME} (owner: {result[0]})")
+                        return True
+            
+            # Verify from blockchain
+            proc = await asyncio.create_subprocess_exec(
+                'emercoin-cli', 'name_show', f'dns:{DOMAIN_NAME}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                domain_data = json.loads(stdout.decode())
+                owner_address = domain_data.get('address')
+                
+                # Store verified domain info in database
+                async with aiosqlite.connect(DB_NAME) as db:
+                    await db.execute("""
+                        INSERT OR REPLACE INTO domain_settings 
+                        (domain, owner_address, verified_at)
+                        VALUES (?, ?, ?)
+                    """, (DOMAIN_NAME, owner_address, int(time.time())))
+                    await db.commit()
+                
+                logging.info(f"Domain verified: {DOMAIN_NAME} (owner: {owner_address})")
+                return True
+        except Exception as e:
+            logging.error(f"Domain verification error: {e}")
+    
+    logging.error(f"Domain verification failed: {DOMAIN_NAME}")
+    return False
+
+# Global semaphore for domain verification
+domain_verification_lock = asyncio.Semaphore(1)
+
+async def get_yggdrasil_pubkey():
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'yggdrasilctl', 'getSelf',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            data = json.loads(stdout.decode())
+            return data.get('key')
+    except:
+        pass
+    return None
+
+async def register_identity(request, economic_defense, crypto, integrity):
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
+    
+    username = data.get('username')
+    domain = data.get('domain')
+    tx_hash = data.get('tx_hash')
+    ygg_pubkey = data.get('ygg_pubkey')
+    
+    if not username or not domain:
+        return web.json_response({"status": "error", "message": "Missing username or domain"}, status=400)
+    
+    # Verify domain matches our domain
+    if domain != DOMAIN_NAME:
+        return web.json_response({"status": "error", "message": f"This node only handles {DOMAIN_NAME}"}, status=400)
+    
+    address = f"{username}@{domain}"
+    if not ADDRESS_REGEX.match(address):
+        return web.json_response({"status": "error", "message": "Invalid address format"}, status=400)
+    
+    if not ygg_pubkey:
+        ygg_pubkey = await get_yggdrasil_pubkey()
+        if not ygg_pubkey:
+            return web.json_response({"status": "error", "message": "Yggdrasil public key required"}, status=400)
+    
+    required_cost = await economic_defense.calculate_registration_cost(domain, ygg_pubkey)
+    
+    if required_cost > economic_defense.base_cost:
+        if not tx_hash:
+            owner_address = await economic_defense.get_domain_owner_address(domain)
+            if not owner_address:
+                return web.json_response({"status": "error", "message": "Domain owner not found"}, status=500)
+            
+            return web.json_response({
+                "status": "payment_required",
+                "cost": required_cost,
+                "currency": "EMC",
+                "pay_to": owner_address,
+                "domain": domain
+            }, status=402)
+        
+        if not await economic_defense.verify_domain_payment(domain, required_cost, tx_hash):
+            return web.json_response({"status": "payment_invalid", "required": required_cost}, status=400)
+    
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            './tpm_provisioning.sh',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, 'USER': username, 'DOMAIN': domain}
+        )
+        stdout, stderr = await proc.communicate()
+        
+        if proc.returncode != 0:
+            raise Exception("TPM provisioning failed")
+        
+        pubkey = stdout.decode().strip()
+        
+        # Encrypt PII data
+        encrypted_address = crypto.encrypt(address)
+        encrypted_ygg = crypto.encrypt(ygg_pubkey)
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO address_keys (address, pubkey, ygg_pubkey, created_at) 
+                VALUES (?, ?, ?, ?)
+            """, (encrypted_address, pubkey, encrypted_ygg, int(time.time())))
+            
+            await db.execute("""
+                UPDATE domain_settings 
+                SET income_earned = income_earned + ?,
+                    pending_updates = pending_updates + 1
+                WHERE domain = ?
+            """, (required_cost, domain))
+            if not db.total_changes:
+                await db.execute("""
+                    INSERT INTO domain_settings (domain, income_earned, pending_updates)
+                    VALUES (?, ?, 1)
+                """, (domain, required_cost))
+            await db.commit()
+        
+        # Update database integrity
+        await integrity.update_integrity()
+        
+        await economic_defense.update_risk_record(domain, ygg_pubkey, username)
+        
+        return web.json_response({
+            "status": "success",
+            "address": address,
+            "cost_paid": required_cost,
+            "ygg_pubkey": ygg_pubkey
+        })
+        
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+async def periodic_integrity_check(integrity):
+    while True:
+        await asyncio.sleep(INTEGRITY_CHECK_INTERVAL)
+        try:
+            if not await integrity.verify_integrity():
+                logging.error("Periodic integrity check failed!")
+                # Could trigger alerts or shutdown
+        except Exception as e:
+            logging.error(f"Integrity check error: {e}")
+
+async def init_app():
+    global aiosqlite
+    import aiosqlite
+    
+    await setup_database()
+    
+    if not await verify_domain_ownership():
+        raise Exception("Domain verification failed")
+    
+    app = web.Application()
+    crypto = AESCrypto()
+    integrity = DatabaseIntegrity(DB_NAME, crypto)
+    economic_defense = EconomicDefense(DB_NAME)
+    
+    # Initial integrity check
+    await integrity.update_integrity()
+    
+    # Start periodic integrity checks
+    asyncio.create_task(periodic_integrity_check(integrity))
+    
+    # Routes
+    app.router.add_get('/api/v1/health', lambda r: web.json_response({
+        "status": "healthy", 
+        "domain": DOMAIN_NAME,
+        "timestamp": int(time.time())
+    }))
+    
+    app.router.add_post('/api/v1/register', 
+                       lambda r: register_identity(r, economic_defense, crypto, integrity))
+    
+    # CORS
+    async def cors_middleware(request, handler):
+        response = await handler(request)
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'X-API-Key, Content-Type'
+        return response
+    
+    app.middlewares.append(cors_middleware)
+    
+    return app
 
 def main():
+    APIHandler.setup_database_once()
+    
     print(f"Starting Brunnen-G API daemon on port {API_PORT}")
     print("API Version: 1.0.0")
     print(f"Database: {DB_NAME}")
     print(f"Logs: {LOG_FILE}")
+    print(f"PID: {os.getpid()}")
     
-    server = HTTPServer(('', API_PORT), APIHandler)
+    # Write PID file
+    with open("/tmp/brunnen_api.pid", "w") as f:
+        f.write(str(os.getpid()))
+    
     try:
+        server = HTTPServer(('', API_PORT), APIHandler)
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down API daemon")
         server.shutdown()
+    finally:
+        cleanup()
 
 if __name__ == '__main__':
     main()

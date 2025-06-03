@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""
+brunnen_lookup.agi - Asterisk AGI script for Brunnen-G identity dialing
+"""
+
+import sys
+import os
+import re
+import sqlite3
+import requests
+from asterisk.agi import AGI
+
+DB_PATH = "./data/*.db"  # Will glob for actual DB
+API_URL = "http://localhost:8080/api/v1"
+
+def find_database():
+    """Find the Brunnen-G database"""
+    import glob
+    dbs = glob.glob(DB_PATH)
+    return dbs[0] if dbs else None
+
+def lookup_identity(identity):
+    """Lookup identity in local DB or via API"""
+    # Parse identity
+    if '@' in identity:
+        user, domain = identity.split('@', 1)
+    else:
+        return None
+    
+    # Try local database first
+    db_path = find_database()
+    if db_path and os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Check if user has VoIP endpoint configured
+        cursor.execute("""
+            SELECT v.sip_uri, v.ygg_address 
+            FROM address_keys a
+            JOIN voip_endpoints v ON a.address = v.address
+            WHERE a.address = ?
+        """, (identity,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {'sip_uri': result[0], 'ygg_address': result[1]}
+    
+    # Try API lookup
+    try:
+        response = requests.get(
+            f"{API_URL}/voip/lookup",
+            params={'identity': identity},
+            timeout=5
+        )
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    
+    return None
+
+def main():
+    agi = AGI()
+    
+    # Get dialed identity
+    identity = agi.env['agi_arg_1']
+    
+    agi.verbose(f"Looking up Brunnen-G identity: {identity}")
+    
+    # Lookup identity
+    result = lookup_identity(identity)
+    
+    if result:
+        if 'sip_uri' in result:
+            # Direct SIP URI
+            agi.set_variable('SIPURI', result['sip_uri'])
+            agi.verbose(f"Found SIP URI: {result['sip_uri']}")
+        elif 'ygg_address' in result:
+            # Yggdrasil address - use SIP over Yggdrasil
+            ygg_uri = f"sip:{identity}@[{result['ygg_address']}]:5060"
+            agi.set_variable('SIPURI', ygg_uri)
+            agi.verbose(f"Found Yggdrasil URI: {ygg_uri}")
+        else:
+            agi.verbose("No valid endpoint found")
+            agi.set_variable('SIPURI', '')
+    else:
+        agi.verbose(f"Identity not found: {identity}")
+        agi.set_variable('SIPURI', '')
+
+if __name__ == '__main__':
+    main()

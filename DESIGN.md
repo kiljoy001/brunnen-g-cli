@@ -1,8 +1,8 @@
-# Brunnen-G Design Document
+# Brunnen-G Design Document v2.0
 
 ## Architecture Overview
 
-Decentralized PKI using TPM hardware security, Emercoin blockchain persistence, and Yggdrasil mesh networking.
+Decentralized PKI using TPM hardware security, Emercoin blockchain persistence, Yggdrasil mesh networking, with enterprise-grade authentication and monitoring.
 
 ## Core Design Decisions
 
@@ -17,29 +17,40 @@ Decentralized PKI using TPM hardware security, Emercoin blockchain persistence, 
 - **Metadata Protection**: YubiKey-encrypted using challenge-response
 - **Storage**: All sensitive files in `/dev/shm` (memory-only)
 - **Key Export**: Never leave TPM hardware
+- **WebAuthn Integration**: Domain seeds via platform authenticators
 
 #### Metadata Encryption Design
 
 **Files:**
 - `/tpmdata/provisioning.enc` - Encrypted metadata
-- `/tpmdata/.challenge` - YubiKey challenge (32 bytes hex)
+- `/dev/shm/.brunnen_challenge` - YubiKey challenge (32 bytes hex)
+- `/tpmdata/provisioning.hash` - Content hash for change detection
 - `/dev/shm/handle.txt` - Temporary handle file
 
 **Encryption Process:**
 1. Generate random 32-byte challenge
 2. Get YubiKey challenge-response (slot 2, hex mode)
-3. Use response as AES-256-CBC key
+3. Use response as AES-256-CBC key with PBKDF2
 4. Encrypt metadata JSON with OpenSSL
-5. Store challenge file separately
+5. Store challenge in memory-only filesystem
 
 **Metadata Contents:**
 ```json
 {
-  "primary_handle": "0x81001234",
-  "key_handle": "0x81005678", 
-  "created_at": 1234567890,
-  "version": "1.0",
-  "randomized": true
+  "identities": {
+    "user@domain.coin": {
+      "tpm_handle": "0x810012DF",
+      "created_at": "1234567890",
+      "encryption_method": "yubikey_aes"
+    }
+  },
+  "domain_settings": {
+    "domain.coin": {
+      "seed": "sha256_domain_seed",
+      "created_at": 1234567890
+    }
+  },
+  "version": "2.0"
 }
 ```
 
@@ -48,11 +59,9 @@ Decentralized PKI using TPM hardware security, Emercoin blockchain persistence, 
 - Metadata unrecoverable without YubiKey
 - Handles randomized to prevent enumeration
 - Temporary files in memory only
+- Content hash prevents unnecessary re-encryption
 
 ### Database Schema
-- **Local DB**: SQLite with merkle tree verification
-- **API DB**: Separate database for API keys/settings
-- **Naming**: Hash of `hostname + username` for obfuscation
 
 #### Core Tables
 
@@ -62,31 +71,51 @@ CREATE TABLE address_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     address TEXT NOT NULL UNIQUE,     -- user@domain.coin
     pubkey TEXT NOT NULL,             -- TPM public key (hex)
-    tmp_key TEXT,                     -- Node TPM public key
+    TPM_key TEXT,                     -- TPM handle
     TPM_enable BOOLEAN DEFAULT 1,     -- TPM required flag
     yubikey_hash TEXT DEFAULT '',     -- YubiKey cert hash
     row_hash BLOB                     -- SHA256 of row data
 );
 ```
 
-**db_root** 
+**domain_settings**
 ```sql
-CREATE TABLE db_root (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    table_name TEXT NOT NULL,         -- Target table name
-    root BLOB NOT NULL,               -- Merkle root hash
-    row_hash BLOB                     -- Hash of this record
+CREATE TABLE domain_settings (
+    domain TEXT PRIMARY KEY,
+    owner_address TEXT,               -- Blockchain address
+    verified_at INTEGER               -- Timestamp of last verification
 );
 ```
-*Purpose: Stores merkle tree roots for data integrity verification. Each table gets a merkle root computed from all row hashes, enabling cryptographic proof of database state.*
 
-**tpm_domain_settings**
+**api_keys**
 ```sql
-CREATE TABLE tmp_domain_settings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    domain TEXT NOT NULL UNIQUE,     -- domain.coin
-    TPM_enable BOOLEAN DEFAULT 1,    -- Domain TPM policy
-    row_hash BLOB                     -- SHA256 of row data
+CREATE TABLE api_keys (
+    app_name TEXT PRIMARY KEY,
+    api_key TEXT NOT NULL,            -- SHA256 hash
+    permissions TEXT DEFAULT 'read',   -- Comma-separated
+    created_at INTEGER,
+    last_used INTEGER
+);
+```
+
+**voip_endpoints**
+```sql
+CREATE TABLE voip_endpoints (
+    address TEXT PRIMARY KEY,
+    sip_uri TEXT,                     -- Direct SIP URI
+    ygg_address TEXT,                 -- Yggdrasil IPv6
+    created_at INTEGER
+);
+```
+
+**storage_refs**
+```sql
+CREATE TABLE storage_refs (
+    id TEXT PRIMARY KEY,              -- SHA256 of content
+    type TEXT NOT NULL,               -- cbor|ipfs|bt
+    ref TEXT NOT NULL,                -- Storage reference
+    size INTEGER,
+    created_at INTEGER
 );
 ```
 
@@ -102,19 +131,18 @@ CREATE TABLE tmp_domain_settings (
 ```
 dns:domain.coin = {
   "AAAA": "200:1234::abcd",  // Yggdrasil IPv6
+  "trust": {
+    "cid": "QmHash...",
+    "merkle_root": "abc123..."
+  },
   "other_dns_records": "..."
-}
-
-trust:domain.coin = {
-  "cid": "QmHash...",
-  "merkle_root": "abc123..."
 }
 ```
 
 ### Group Registry
 ```
 registry:domain.coin:88815158 = {
-  "members": ["user_tmp_hash1", "user_tpm_hash2"],
+  "members": ["user_tpm_hash1", "user_tpm_hash2"],
   "nodes": ["blake2b_base58_address1", "blake2b_base58_address2"],
   "owner": "domain_owner_address", 
   "group_id": 88815158,
@@ -132,130 +160,199 @@ risk:medium_file = "ipfs:QmV8cfu6n4NT5xRr6AuvLs7PiLoXf7q8VDdV7qJj8x8x"  // IPFS 
 risk:large_dataset = "A2677472616E6B657273...746F7272656E74"  // CBOR{tracker, torrent_data} >5GB
 ```
 
-**Use Cases by Tier:**
-- **CBOR**: API keys, configs, incident reports, contact info
-- **IPFS**: VM images, code repos, forensic data, ML datasets  
-- **BitTorrent**: System backups, video archives, database dumps
-
-**Advantages**: No vendor lock-in, immutable timestamps, global accessibility, cost-effective for large files, cryptographic proof of existence.
-
 ## Storage Tiers
 
-1. **CBOR**: Small data (<15KB) directly on blockchain
-2. **IPFS**: Medium files (<5GB) with CID references
-3. **BitTorrent**: Large files (>5GB) with torrent hashes
+1. **CBOR** (<15KB): Direct blockchain storage
+   - API keys, configs, certificates
+   - Incident reports, signatures
+   - Small JSON documents
 
-## Zero-Trust Model
+2. **IPFS** (<5GB): Distributed hash-addressed
+   - VM images, container images
+   - Code repositories
+   - Documentation, forensic data
 
-### Authentication Requirements
-- User identity verification (TPM-backed)
-- Machine verification (node address)
-- Domain ownership validation
-- Group membership confirmation
+3. **BitTorrent** (>5GB): P2P distribution
+   - System backups
+   - Video archives
+   - Large database dumps
 
-### Group Permissions
-- Domain owner controls membership
-- Per-group device restriction settings
-- Cross-machine synchronization via blockchain
-- PAM integration for local group creation
+## Authentication Stack
+
+### PAM Module
+- **File**: `pam_brunnen_g.so`
+- **Integration**: `/etc/pam.d/common-auth`
+- **Flow**: Username → API verify → TPM challenge → Success
+- **Features**: 
+  - YubiKey OTP support
+  - Offline cache capability
+  - Group membership sync
+
+### WebAuthn Domain Seeds
+- **Endpoint**: `http://localhost:8888`
+- **Storage**: TPM-sealed with PCR policy
+- **Purpose**: Hardware-backed domain identity
+- **Recovery**: Requires same TPM + PCR state
 
 ## Network Architecture
 
 ### Yggdrasil Integration
-- TPM-secured private keys for network identity
-- Mesh routing for global connectivity
-- IPv6 addresses for peer communication
+- TPM-secured private keys
+- Auto-start with systemd
+- Mesh routing for global reach
+- IPv6 addresses for all services
+
+### VoIP Integration
+- **Protocol**: SIP over Yggdrasil
+- **Dialing**: `user@domain.coin`
+- **AGI Script**: `brunnen_lookup.agi`
+- **Fallback**: PSTN via E.164 mapping
 
 ### API Design
-- Read-only public endpoints
-- Admin functions require authentication
-- Rate limiting by application/IP
-- HMAC request signing
+- **Port**: 8080 (configurable)
+- **Auth**: HMAC-SHA256 signatures
+- **Rate Limiting**: Per-app configurable
+- **Monitoring**: Wazuh integration
 
-## Development Phases
+## Monitoring & Security
 
-### Phase 1 (Current)
-- Core identity registration
-- TPM integration
-- Database operations
-- Basic API
+### Wazuh SIEM Integration
+- **Events**: Identity ops, API access, TPM operations
+- **Socket**: `/var/ossec/queue/ossec/queue`
+- **Format**: JSON with rule metadata
+- **Dashboard**: Real-time security monitoring
 
-### Phase 2 
-- PAM module
-- Group registry implementation
-- Data layer (CBOR/IPFS/BitTorrent)
-- Cross-machine synchronization
-
-### Phase 3
-- Enterprise features
-- Wazuh SIEM integration
-- Web interface polishing
-
-## Security Considerations
-
-### Hardware Requirements
-- TPM 2.0 mandatory
-- YubiKey mandatory for metadata encryption
-- Secure boot recommended
-
-### Operational Security
-- Regular backup of encrypted metadata
-- Domain expiration monitoring
-- Key rotation procedures
-- Audit logging
-
-### Privacy Model
-- Public: Domain registrations, group memberships
-- Private: User data, TPM keys, metadata
-- Semi-private: Network addresses (visible to Ygg peers)
-
-## Open Questions
-
-### Technical
-- [ ] PAM module integration approach
-- [ ] VoIP SIP integration details  
-- [ ] Certificate chain validation
-- [ ] Group permission inheritance
-
-### Operational
-- [ ] Key recovery procedures
-- [ ] Multi-domain federation
-- [ ] Performance benchmarks
-- [ ] Backup/restore workflows
+### Security Hardening
+- Mandatory TPM 2.0
+- YubiKey for metadata protection
+- Memory-only sensitive files
+- Automatic cleanup on exit
+- Secure random from TPM
 
 ## API Endpoints
 
 ### Public
 - `GET /api/v1/health` - System status
 - `GET /api/v1/query?address=user@domain.coin` - User lookup
+- `GET /api/v1/verify?address=user@domain.coin` - Identity verification
 
-### Authenticated  
+### Authenticated
+- `POST /api/v1/register` - Identity registration
+- `POST /api/v1/sign` - TPM signing
+- `POST /api/v1/verify-signature` - Signature verification
 - `GET /api/v1/metrics` - Usage statistics (admin)
 - `POST /api/v1/admin/keys` - API key management (admin)
+
+### Storage
+- `POST /api/v1/storage/store` - Store with auto-tiering
+- `GET /api/v1/storage/retrieve?ref=...` - Retrieve by reference
+- `GET /api/v1/voip/lookup?identity=...` - VoIP endpoint lookup
+
+## Development Status
+
+### Phase 1 (Complete)
+- ✓ Core identity registration
+- ✓ TPM integration with randomized handles
+- ✓ YubiKey metadata encryption
+- ✓ Database operations with merkle trees
+- ✓ Basic REST API with HMAC auth
+- ✓ Tiered storage (CBOR/IPFS/BitTorrent)
+
+### Phase 2 (In Progress)
+- ✓ PAM module implementation
+- ✓ WebAuthn domain seeds
+- ✓ VoIP/Asterisk integration
+- ✓ Wazuh SIEM monitoring
+- ◯ Group registry implementation
+- ◯ Cross-machine synchronization
+
+### Phase 3 (Planned)
+- ◯ Enterprise SSO (Keycloak)
+- ◯ Web UI improvements
+- ◯ Mobile app support
+- ◯ Hardware token provisioning
+- ◯ Compliance reporting
+
+## Operational Procedures
+
+### Backup & Recovery
+1. Export encrypted metadata: `cp /tpmdata/provisioning.enc backup/`
+2. Save YubiKey serial/slot config
+3. Document TPM handles
+4. Blockchain automatic backup via peers
+
+### Key Rotation
+1. Generate new TPM handle
+2. Update address_keys table
+3. Re-sign with domain key
+4. Publish new merkle root
+5. Keep old handle for transition
+
+### Domain Expiration Monitoring
+- Check: `emercoin-cli name_show "dns:domain.coin"`
+- Alert threshold: 30 days
+- Auto-renewal via API (planned)
 
 ## File Structure
 ```
 brunnen-g-cli/
-├── brunnen-cli.sh              # Main interface
-├── api_daemon.py               # REST API
-├── data/                       # Local databases  
-├── tmp/                        # TPM utilities
-├── PAM/                        # Authentication module
-├── web/                        # Web interface
-└── DESIGN.md                   # This document
+├── brunnen-cli.sh              # Main CLI interface
+├── api_daemon.py               # REST API server
+├── webauthn_seed.py           # WebAuthn server
+├── wazuh_monitor.py           # SIEM integration
+├── data/                      # Local databases
+│   └── *.db                   # Named by hostname hash
+├── tpmdata/                   # TPM metadata
+│   ├── provisioning.enc       # YubiKey-encrypted
+│   └── provisioning.hash      # Content hash
+├── tpm/                       # TPM utilities
+│   └── tpm_provisioning.sh    # Handle generation
+├── pam/                       # PAM module
+│   ├── pam_brunnen_g.c       # Source code
+│   └── Makefile              # Build system
+├── web/                       # Web interface
+│   └── brunnen-g.html        # Agregore UI
+└── DESIGN.md                  # This document
 ```
 
 ## Dependencies
 
 ### Required
-- TPM 2.0 hardware
-- YubiKey hardware token
-- Emercoin node with CLI access
-- Python 3.8+ with systemd-python
-- Go 1.19+ for Yggdrasil
+- TPM 2.0 hardware with tpm2-tools
+- YubiKey with challenge-response
+- Emercoin node with RPC access
+- Python 3.8+ with pip packages:
+  - flask, fido2, cryptography
+  - requests, sqlite3, cbor2
+- Yggdrasil mesh daemon
 - IPFS daemon
-- BitTorrent client/tracker (transmission-daemon or qBittorrent)
 
 ### Optional
-- Wazuh for monitoring
-- Keycloak integration for enterprise SSO
+- Wazuh agent for monitoring
+- Asterisk for VoIP
+- BitTorrent client (transmission)
+- Keycloak for enterprise SSO
+
+## Performance Targets
+
+- Identity verification: <100ms local, <500ms remote
+- TPM operations: <200ms signing, <300ms verification  
+- API response time: <50ms cached, <200ms uncached
+- Database sync: <10s for 10k identities
+- Storage tier selection: Automatic based on size
+
+## Future Enhancements
+
+### Technical Roadmap
+- [ ] HSM support for enterprise
+- [ ] Post-quantum crypto readiness
+- [ ] Distributed database sync protocol
+- [ ] Zero-knowledge proofs for privacy
+- [ ] Smart contract automation
+
+### Integration Targets
+- [ ] Active Directory federation
+- [ ] LDAP/RADIUS compatibility
+- [ ] OAuth2/OIDC provider
+- [ ] Kubernetes admission control
+- [ ] CI/CD pipeline integration
