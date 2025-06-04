@@ -29,6 +29,510 @@ cleanup_temp_files() {
     rm -f /tmp/.brunnen_domain_address_tmp 2>/dev/null || true
 }
 
+# Replace generate_random_handle() function with:
+generate_random_handle() {
+    # Use valid persistent handle range
+    local MIN=0x81000000
+    local MAX=0x810FFFFF
+    printf "0x%08x\n" $((RANDOM % (MAX - MIN + 1) + MIN))
+}
+
+# Update create_primary_if_needed() function:
+create_primary_if_needed() {
+    if ! handle_exists "$PRIMARY_HANDLE"; then
+        echo "Creating primary key ($PRIMARY_HANDLE)..."
+        # Use RSA for better compatibility
+        run_checked tpm2_createprimary -C o -g sha256 -G rsa -c /dev/shm/primary.ctx
+        run_checked tpm2_evictcontrol -C o -c /dev/shm/primary.ctx "$PRIMARY_HANDLE"
+    else
+        echo "Primary handle exists: $PRIMARY_HANDLE"
+    fi
+}
+
+# Update handle_exists() to be case-insensitive:
+handle_exists() {
+    local handle_uppercase=$(echo "$1" | tr 'a-f' 'A-F')
+    local handle_lowercase=$(echo "$1" | tr 'A-F' 'a-f')
+    tpm2_getcap handles-persistent | grep -qiE "$handle_uppercase|$handle_lowercase"
+}
+
+# Spending control functions for brunnen-g-cli.sh
+verify_admin_status() {
+    echo "=== Verify Admin Status ==="
+    echo "Insert YubiKey and press Enter..."
+    read
+    
+    if ! ykman piv certificates export 9a /tmp/verify.pem 2>/dev/null; then
+        echo "Failed to read YubiKey"
+        return 1
+    fi
+    
+    cert_hash=$(openssl x509 -in /tmp/verify.pem -outform DER | sha256sum | cut -d' ' -f1)
+    
+    role=$(sqlite3 "$DB_NAME" "SELECT role FROM admin_auth WHERE yubikey_cert_hash = '$cert_hash'")
+    
+    if [[ -n "$role" ]]; then
+        echo "[OK] YubiKey is authorized as: $role"
+        echo "Certificate hash: ${cert_hash:0:16}..."
+    else
+        echo "[FAIL] YubiKey is not an admin"
+    fi
+    
+    rm -f /tmp/verify.pem
+}
+
+init_admin_setup() {
+    echo "=== One-Time Admin Setup ==="
+    
+    # Check if already initialized
+    if [[ -f "${DB_NAME}.setup" ]]; then
+        echo "Setup already complete"
+        return 0
+    fi
+
+    # Check if TPM master key already exists
+    if tpm2_getcap handles-persistent | grep -q "0x81800000"; then
+        echo "TPM master key already exists"
+    else
+        # Create semaphore lock
+        exec 200>/var/lock/brunnen_admin_setup.lock
+        if ! flock -n 200; then
+            echo "Setup already in progress"
+            return 1
+        fi
+        
+        echo "Generating TPM master key..."
+        
+        # Clear any existing handle first
+        tpm2_evictcontrol -C o -c 0x81800000 2>/dev/null || true
+        
+        # Create primary key
+        tpm2_createprimary -C o -g sha256 -G aes -c /tmp/master.ctx
+        
+        # Make persistent
+        tpm2_evictcontrol -C o -c /tmp/master.ctx 0x81800000
+        rm -f /tmp/master.ctx
+        
+        # Release lock
+        flock -u 200
+    fi
+    
+    echo "Starting initial admin setup..."
+    
+    # Initialize database tables
+    init_spending_tables
+    
+    # Setup admin YubiKey
+    echo "Insert admin YubiKey and press Enter..."
+    read
+    
+    if ! ykman piv certificates export 9a /tmp/admin_cert.pem; then
+        echo "Failed to read YubiKey"
+        return 1
+    fi
+    
+    admin_cert_hash=$(openssl x509 -in /tmp/admin_cert.pem -outform DER | sha256sum | cut -d' ' -f1)
+    
+    sqlite3 "$DB_NAME" "INSERT INTO admin_auth 
+                       (yubikey_cert_hash, role, created_at, created_by)
+                       VALUES ('$admin_cert_hash', 'super_admin', $(date +%s), 'initial_setup');"
+    
+    # Set initial spending limits
+    configure_spending_limits
+    
+    # Mark setup complete
+    echo "{\"setup_date\": $(date +%s), \"admin\": \"$admin_cert_hash\"}" > "${DB_NAME}.setup"
+    
+    echo "Admin setup complete!"
+    rm -f /tmp/admin_cert.pem
+}
+
+init_spending_tables() {
+    sqlite3 "$DB_NAME" "
+    CREATE TABLE IF NOT EXISTS admin_auth (
+        yubikey_cert_hash TEXT PRIMARY KEY,
+        role TEXT DEFAULT 'admin',
+        created_at INTEGER,
+        created_by TEXT,
+        last_auth INTEGER
+    );
+    
+    CREATE TABLE IF NOT EXISTS spending_limits (
+        id INTEGER PRIMARY KEY,
+        encrypted_data BLOB NOT NULL,
+        nonce BLOB NOT NULL,
+        updated_at INTEGER,
+        updated_by TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS transaction_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER,
+        action TEXT NOT NULL,
+        amount REAL,
+        balance_before REAL,
+        balance_after REAL,
+        authorized_by TEXT,
+        status TEXT,
+        details TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS action_permissions (
+        action TEXT PRIMARY KEY,
+        require_yubikey BOOLEAN DEFAULT 1,
+        max_amount REAL,
+        daily_limit REAL
+    );"
+}
+
+configure_spending_limits() {
+    echo "=== Configure Spending Limits ==="
+    
+    # Verify admin YubiKey
+    if ! verify_admin_yubikey; then
+        echo "Admin authentication required"
+        return 1
+    fi
+    
+    echo "Current limits:"
+    show_spending_limits
+    
+    echo -n "Daily total limit (EMC): "
+    read daily_total
+    echo -n "Per transaction limit (EMC): "
+    read per_tx
+    echo -n "Blockchain posting limit (EMC): "
+    read blockchain_limit
+    
+    # Create JSON limits
+    limits_json="{
+        \"daily_total\": $daily_total,
+        \"per_transaction\": $per_tx,
+        \"blockchain_posting\": $blockchain_limit,
+        \"auto_approve_threshold\": 0.1
+    }"
+    
+    # Encrypt using TPM
+    echo "$limits_json" > /tmp/limits.json
+    
+    # Generate key material from TPM
+    tpm2_hmac -c 0x81800000 --hex "brunnen-g-spending-limits" -o /tmp/key.bin
+    
+    # Encrypt with openssl (simplified version)
+    openssl enc -aes-256-cbc -salt -in /tmp/limits.json -out /tmp/limits.enc \
+            -pass file:/tmp/key.bin
+    
+    # Store encrypted limits
+    sqlite3 "$DB_NAME" "INSERT INTO spending_limits 
+                       (encrypted_data, nonce, updated_at, updated_by)
+                       VALUES (readfile('/tmp/limits.enc'), randomblob(12), 
+                               $(date +%s), '$admin_cert_hash');"
+    
+    # Set action permissions
+    sqlite3 "$DB_NAME" "INSERT OR REPLACE INTO action_permissions 
+                       (action, require_yubikey, max_amount, daily_limit)
+                       VALUES 
+                       ('blockchain_post', 1, $blockchain_limit, $(echo "$blockchain_limit * 10" | bc)),
+                       ('ipfs_pin', 0, 1.0, 100.0),
+                       ('domain_register', 1, 5.0, 20.0);"
+    
+    echo "Spending limits configured"
+    
+    # Cleanup
+    shred -u /tmp/limits.json /tmp/limits.enc /tmp/key.bin 2>/dev/null || true
+}
+
+verify_admin_yubikey() {
+    echo "Insert admin YubiKey and press Enter..."
+    read
+    
+    if ! ykman piv certificates export 9a /tmp/verify_cert.pem 2>/dev/null; then
+        echo "Failed to read YubiKey"
+        return 1
+    fi
+    
+    cert_hash=$(openssl x509 -in /tmp/verify_cert.pem -outform DER | sha256sum | cut -d' ' -f1)
+    admin_cert_hash="$cert_hash"  # Export for use
+    
+    # Check if authorized
+    authorized=$(sqlite3 "$DB_NAME" "SELECT role FROM admin_auth 
+                                    WHERE yubikey_cert_hash = '$cert_hash';")
+    
+    if [[ -n "$authorized" ]]; then
+        # Update last auth
+        sqlite3 "$DB_NAME" "UPDATE admin_auth SET last_auth = $(date +%s) 
+                           WHERE yubikey_cert_hash = '$cert_hash';"
+        rm -f /tmp/verify_cert.pem
+        return 0
+    else
+        echo "Unauthorized YubiKey"
+        rm -f /tmp/verify_cert.pem
+        return 1
+    fi
+}
+
+authorize_spending() {
+    local action="$1"
+    local amount="$2"
+    
+    # Check action permissions
+    perms=$(sqlite3 "$DB_NAME" "SELECT require_yubikey, max_amount, daily_limit 
+                                FROM action_permissions WHERE action = '$action';")
+    
+    if [[ -z "$perms" ]]; then
+        echo "Unknown action: $action"
+        return 1
+    fi
+    
+    IFS='|' read -r require_yubikey max_amount daily_limit <<< "$perms"
+    
+    # Check if YubiKey required
+    if [[ "$require_yubikey" == "1" ]]; then
+        if ! verify_admin_yubikey; then
+            echo "YubiKey authorization required"
+            return 1
+        fi
+    fi
+    
+    # Check amount limits
+    if (( $(echo "$amount > $max_amount" | bc -l) )); then
+        echo "Amount exceeds maximum: $max_amount EMC"
+        return 1
+    fi
+    
+    # Check daily spent
+    today_start=$(date -d "today 00:00:00" +%s)
+    daily_spent=$(sqlite3 "$DB_NAME" "SELECT COALESCE(SUM(amount), 0) 
+                                      FROM transaction_log 
+                                      WHERE action = '$action' 
+                                        AND timestamp >= $today_start 
+                                        AND status = 'completed';")
+    
+    if (( $(echo "$daily_spent + $amount > $daily_limit" | bc -l) )); then
+        echo "Would exceed daily limit: $daily_limit EMC"
+        echo "Already spent today: $daily_spent EMC"
+        return 1
+    fi
+    
+    # Check wallet balance
+    wallet_balance=$(emercoin-cli getbalance 2>/dev/null || echo "0")
+    
+    if (( $(echo "$wallet_balance < $amount" | bc -l) )); then
+        echo "Insufficient wallet balance: $wallet_balance EMC"
+        return 1
+    fi
+    
+    echo "Transaction authorized"
+    echo "  Amount: $amount EMC"
+    echo "  Balance: $wallet_balance EMC"
+    echo "  Daily spent: $daily_spent EMC"
+    
+    return 0
+}
+
+execute_blockchain_transaction() {
+    local name="$1"
+    local value="$2"
+    local days="${3:-365}"
+    local amount="${4:-1.0}"
+    
+    echo "=== Execute Blockchain Transaction ==="
+    
+    # Authorize spending
+    if ! authorize_spending "blockchain_post" "$amount"; then
+        echo "Transaction not authorized"
+        return 1
+    fi
+    
+    # Get balance before
+    balance_before=$(emercoin-cli getbalance 2>/dev/null || echo "0")
+    
+    # Execute transaction
+    echo "Posting to blockchain..."
+    if emercoin-cli name_new "$name" "$value" "$days"; then
+        status="completed"
+        balance_after=$(emercoin-cli getbalance 2>/dev/null || echo "0")
+        echo "Transaction successful"
+    else
+        status="failed"
+        balance_after="$balance_before"
+        echo "Transaction failed"
+    fi
+    
+    # Log transaction
+    details="{\"name\": \"$name\", \"days\": $days}"
+    sqlite3 "$DB_NAME" "INSERT INTO transaction_log 
+                       (timestamp, action, amount, balance_before, balance_after, 
+                        authorized_by, status, details)
+                       VALUES ($(date +%s), 'blockchain_post', $amount, 
+                               $balance_before, $balance_after, 
+                               '${admin_cert_hash:-system}', '$status', '$details');"
+    
+    echo "New balance: $balance_after EMC"
+}
+
+show_spending_limits() {
+    echo "=== Current Spending Limits ==="
+    
+    sqlite3 "$DB_NAME" -header -column "
+        SELECT action, 
+               require_yubikey as yubikey,
+               max_amount as max_tx,
+               daily_limit
+        FROM action_permissions;"
+}
+
+show_transaction_log() {
+    echo "=== Recent Transactions ==="
+    
+    sqlite3 "$DB_NAME" -header -column "
+        SELECT datetime(timestamp, 'unixepoch') as time,
+               action,
+               amount,
+               status,
+               balance_after as balance
+        FROM transaction_log
+        ORDER BY timestamp DESC
+        LIMIT 20;"
+}
+
+spending_summary() {
+    echo "=== Spending Summary ==="
+    
+    # Today's spending
+    today_start=$(date -d "today 00:00:00" +%s)
+    today_spent=$(sqlite3 "$DB_NAME" "SELECT COALESCE(SUM(amount), 0) 
+                                      FROM transaction_log 
+                                      WHERE timestamp >= $today_start 
+                                        AND status = 'completed';")
+    
+    # Current balance
+    wallet_balance=$(emercoin-cli getbalance 2>/dev/null || echo "0")
+    
+    echo "Current balance: $wallet_balance EMC"
+    echo "Spent today: $today_spent EMC"
+    
+    # Spending by action
+    echo ""
+    echo "Today's spending by action:"
+    sqlite3 "$DB_NAME" -header -column "
+        SELECT action,
+               COUNT(*) as count,
+               SUM(amount) as total
+        FROM transaction_log
+        WHERE timestamp >= $today_start
+          AND status = 'completed'
+        GROUP BY action;"
+}
+
+# Enhanced publish function with spending controls
+publish_to_emercoin_secure() {
+    local domain="$1"
+    local cid="$2"
+    local merkle_root="$3"
+    local ygg_addr="$4"
+    
+    # Estimate cost based on data size
+    data_size=${#cid}+${#merkle_root}+${#ygg_addr}
+    estimated_cost=$(echo "scale=4; 0.01 + ($data_size * 0.00001)" | bc)
+    
+    echo "Estimated blockchain cost: $estimated_cost EMC"
+    echo -n "Proceed with YubiKey authorization? (y/n): "
+    read proceed
+    
+    if [[ "$proceed" != "y" ]]; then
+        return 0
+    fi
+    
+    # Build value JSON
+    value_json=$(jq -n \
+        --arg cid "$cid" \
+        --arg merkle "$merkle_root" \
+        --arg ygg "$ygg_addr" \
+        '{brunnen_g: {cid: $cid, merkle_root: $merkle, yggdrasil: $ygg}}')
+    
+    # Execute with spending controls
+    execute_blockchain_transaction "dns:$domain" "$value_json" 365 "$estimated_cost"
+}
+
+# Admin menu
+admin_menu() {
+    echo "=== Admin Controls ==="
+    echo "1) Initial setup"
+    echo "2) Configure spending limits"
+    echo "3) View spending limits"
+    echo "4) Transaction log"
+    echo "5) Spending summary"
+    echo "6) Add admin"
+    echo "7) Admin verification"
+    echo -n "Choice: "
+    read choice
+    
+    case $choice in
+        1) init_admin_setup ;;
+        2) configure_spending_limits ;;
+        3) show_spending_limits ;;
+        4) show_transaction_log ;;
+        5) spending_summary ;;
+        6) 
+            echo -n "New admin name: "
+            read admin_name
+            add_admin_yubikey "$admin_name"
+            ;;
+        7) verify_admin_status ;;
+    esac
+}
+
+add_admin_yubikey() {
+    local admin_name="$1"
+    
+    # Verify current admin
+    if ! verify_admin_yubikey; then
+        echo "Admin authentication required"
+        return 1
+    fi
+    
+    echo "Insert new admin's YubiKey and press Enter..."
+    read
+    
+    if ! ykman piv certificates export 9a /tmp/new_admin.pem; then
+        echo "Failed to read YubiKey"
+        return 1
+    fi
+    
+    new_cert_hash=$(openssl x509 -in /tmp/new_admin.pem -outform DER | sha256sum | cut -d' ' -f1)
+    
+    sqlite3 "$DB_NAME" "INSERT OR IGNORE INTO admin_auth 
+                       (yubikey_cert_hash, role, created_at, created_by)
+                       VALUES ('$new_cert_hash', 'admin', $(date +%s), '$admin_cert_hash');"
+    
+    echo "Added admin: $admin_name"
+    rm -f /tmp/new_admin.pem
+}
+
+configure_domain_whitelist() {
+    echo -n "Domain: "
+    read domain
+    
+    echo -n "Enable whitelist mode? (y/n): "
+    read enable
+    
+    sqlite3 "$DB_NAME" "INSERT OR REPLACE INTO domain_policies 
+                       (domain, whitelist_mode) 
+                       VALUES ('$domain', $([ "$enable" = "y" ] && echo 1 || echo 0));"
+}
+
+add_to_whitelist() {
+    echo -n "Domain: "
+    read domain
+    echo -n "Yggdrasil pubkey to allow: "
+    read ygg_key
+    
+    sqlite3 "$DB_NAME" "INSERT INTO domain_whitelists 
+                       (domain, ygg_pubkey, added_by, added_at)
+                       VALUES ('$domain', '$ygg_key', 'admin', $(date +%s));"
+}
+
 # Parse command line arguments
 HACKER_MODE=0
 while [[ $# -gt 0 ]]; do
@@ -814,6 +1318,8 @@ register_identity() {
     echo -n "Domain: "
     read domain
     
+    export BRUNNEN_DOMAIN="$domain"
+
     if ! verify_domain_ownership "$domain"; then
         echo "Domain ownership verification failed"
         return 1
@@ -850,12 +1356,16 @@ register_identity() {
                     
                     # Update database with existing handle
                     tmp_handle="$EXISTING_HANDLE"
-                    tmp_pubkey=$(tpm2_readpublic -c "$tmp_handle" -f der | xxd -p -c 256)
+                    tpm2_readpublic -c "$tmp_handle" -f der -o /dev/shm/tmp_pub.der
+                    tmp_pubkey=$(xxd -p -c 256 < /dev/shm/tmp_pub.der)
+                    shred -u /dev/shm/tmp_pub.der
                     
                     create_database
                     sqlite3 "$DB_NAME" "INSERT OR REPLACE INTO address_keys (address, pubkey, TPM_key, TPM_enable, yubikey_hash) 
                                        VALUES ('$address', '$tmp_pubkey', '$tmp_handle', 1, '');"
-                    
+                    if ! sqlite3 "$DB_NAME" "INSERT OR REPLACE INTO address_keys..."; then
+                        echo "Database insert failed: $?"
+                    fi
                     if [[ "$HACKER_MODE" == "1" ]]; then
                         echo -e "\033[32m[SUCCESS]\033[0m identity.registered: $address"
                         echo -e "\033[37mtmp_handle:\033[0m $tmp_handle"
@@ -1700,46 +2210,331 @@ echo -e "\033[36mcybersec.mesh_authenticated\033[0m"
 initialize_brunnen
 
 # Main menu loop
-while true; do
-    if [[ "$HACKER_MODE" == "1" ]]; then
-        echo -e "\033[32m=== [SYSTEM_ACCESS] ===\033[0m"
-        echo -e "\033[32m1) init\033[0m.\033[37midentity_bootstrap\033[0m"
-        echo -e "\033[32m2) query\033[0m.\033[37muser_database\033[0m" 
-        echo -e "\033[32m3) mesh\033[0m.\033[37mnetwork_ops\033[0m"
-        echo -e "\033[32m4) admin\033[0m.\033[37mroot_access\033[0m"
-        echo -e "\033[32m5) logout\033[0m.\033[37msecure\033[0m"
-    else
-        echo "=== Brunnen-G ==="
-        echo "1) Quick Setup (Register + Start Services)"
-        echo "2) Identity Operations"
-        echo "3) Network & Communication"
-        echo "4) Advanced Settings"
-        echo "5) Exit"
-    fi
-    echo -n "Choice: "
+# Color codes for terminal
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m' # No Color
+
+display_banner() {
+    clear
+    echo -e "${CYAN}"
+    echo " ██████╗ ██████╗ ██╗   ██╗███╗   ██╗███╗   ██╗███████╗███╗   ██╗       ██████╗ "
+    echo " ██╔══██╗██╔══██╗██║   ██║████╗  ██║████╗  ██║██╔════╝████╗  ██║      ██╔════╝ "
+    echo " ██████╔╝██████╔╝██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██╔██╗ ██║█████╗██║  ███╗"
+    echo " ██╔══██╗██╔══██╗██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║╚██╗██║╚════╝██║   ██║"
+    echo " ██████╔╝██║  ██║╚██████╔╝██║ ╚████║██║ ╚████║███████╗██║ ╚████║      ╚██████╔╝"
+    echo " ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═══╝       ╚═════╝ "
+    echo -e "${WHITE}                     [[ DECENTRALIZED PKI INFRASTRUCTURE ]]${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+display_status() {
+    echo -e "${YELLOW}[SYSTEM STATUS]${NC}"
     
-    read choice
-    case $choice in
-        1) quick_setup ;;
-        2) identity_menu ;;
-        3) network_menu ;;
-        4) advanced_menu ;;
-        5) 
-            if [[ "$HACKER_MODE" == "1" ]]; then
-                echo -e "\033[32m=== [SYSTEM_EXIT] ===\033[0m"
-                echo -e "\033[32m1) shutdown\033[0m.\033[37mstop_services_exit\033[0m"
-                echo -e "\033[32m2) logout\033[0m.\033[37mkeep_services_running\033[0m"
-            else
-                echo "=== Exit Options ==="
-                echo "1) Stop services and exit"
-                echo "2) Exit (keep services running)"
-            fi
-            echo -n "Choice: "
-            read exit_choice
-            case $exit_choice in
-                1) stop_api_daemon; stop_yggdrasil; exit 0 ;;
-                2) exit 0 ;;
-            esac
-            ;;
-    esac
-done
+    # Yggdrasil status
+    if pgrep yggdrasil >/dev/null; then
+        local ygg_addr=$(yggdrasilctl getSelf 2>/dev/null | grep -oE '200:[a-f0-9:]+' || echo "UNKNOWN")
+        echo -e " ${GREEN}●${NC} Yggdrasil: ${GREEN}ONLINE${NC} [$ygg_addr]"
+    else
+        echo -e " ${RED}●${NC} Yggdrasil: ${RED}OFFLINE${NC}"
+    fi
+    
+    # API status
+    if pgrep -f "api_daemon.py" >/dev/null; then
+        echo -e " ${GREEN}●${NC} API Daemon: ${GREEN}ONLINE${NC} [Port $API_PORT]"
+    else
+        echo -e " ${RED}●${NC} API Daemon: ${RED}OFFLINE${NC}"
+    fi
+    
+    # Database status
+    if [[ -f "$DB_NAME" ]]; then
+        local db_size=$(du -h "$DB_NAME" | cut -f1)
+        local user_count=$(sqlite3 "$DB_NAME" "SELECT COUNT(*) FROM address_keys;" 2>/dev/null || echo "0")
+        echo -e " ${GREEN}●${NC} Database: ${GREEN}ACTIVE${NC} [Size: $db_size | Users: $user_count]"
+    else
+        echo -e " ${RED}●${NC} Database: ${RED}NOT INITIALIZED${NC}"
+    fi
+    
+    # Admin setup status
+    if [[ -f "${DB_NAME}.setup" ]]; then
+        echo -e " ${GREEN}●${NC} Admin Setup: ${GREEN}COMPLETE${NC}"
+    else
+        echo -e " ${YELLOW}●${NC} Admin Setup: ${YELLOW}PENDING${NC}"
+    fi
+    
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+main_menu() {
+    while true; do
+        display_banner
+        display_status
+        
+        echo -e "${CYAN}[MAIN MENU]${NC}"
+        echo -e "${WHITE} 1)${NC} Identity Management      ${PURPLE}[Register/Query/Verify]${NC}"
+        echo -e "${WHITE} 2)${NC} Security & Access       ${PURPLE}[Registration Controls/YubiKey]${NC}"
+        echo -e "${WHITE} 3)${NC} Network Operations      ${PURPLE}[Yggdrasil/API/P2P]${NC}"
+        echo -e "${WHITE} 4)${NC} Blockchain Operations   ${PURPLE}[Emercoin/IPFS/Storage]${NC}"
+        echo -e "${WHITE} 5)${NC} Administration          ${PURPLE}[Setup/Spending/Logs]${NC}"
+        echo -e "${WHITE} 6)${NC} Quick Actions           ${PURPLE}[Common Tasks]${NC}"
+        echo -e "${WHITE} 0)${NC} Exit"
+        echo ""
+        echo -ne "${GREEN}brunnen-g>${NC} "
+        
+        read -r choice
+        case $choice in
+            1) identity_menu ;;
+            2) security_menu ;;
+            3) network_menu ;;
+            4) blockchain_menu ;;
+            5) admin_menu_enhanced ;;
+            6) quick_actions_menu ;;
+            0) shutdown_services; exit 0 ;;
+            *) echo -e "${RED}[!] Invalid selection${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+identity_menu() {
+    while true; do
+        display_banner
+        echo -e "${CYAN}[IDENTITY MANAGEMENT]${NC}"
+        echo -e "${WHITE} 1)${NC} Register Identity       ${PURPLE}[Create new user@domain.coin]${NC}"
+        echo -e "${WHITE} 2)${NC} Query User             ${PURPLE}[Lookup public key]${NC}"
+        echo -e "${WHITE} 3)${NC} Verify Identity        ${PURPLE}[Check authenticity]${NC}"
+        echo -e "${WHITE} 4)${NC} Sign Data              ${PURPLE}[TPM signature]${NC}"
+        echo -e "${WHITE} 5)${NC} Verify Signature       ${PURPLE}[Check TPM signature]${NC}"
+        echo -e "${WHITE} 6)${NC} YubiKey Operations     ${PURPLE}[Physical key management]${NC}"
+        echo -e "${WHITE} 0)${NC} Back"
+        echo ""
+        echo -ne "${GREEN}identity>${NC} "
+        
+        read -r choice
+        case $choice in
+            1) enhanced_register_identity ;;
+            2) query_user ;;
+            3) verify_identity ;;
+            4) sign_data ;;
+            5) verify_signature ;;
+            6) yubikey_menu ;;
+            0) return ;;
+            *) echo -e "${RED}[!] Invalid selection${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+security_menu() {
+    while true; do
+        display_banner
+        echo -e "${CYAN}[SECURITY & ACCESS CONTROL]${NC}"
+        echo -e "${WHITE} 1)${NC} Configure Domain       ${PURPLE}[Set registration rules]${NC}"
+        echo -e "${WHITE} 2)${NC} Manage Approvers       ${PURPLE}[Add/remove YubiKey admins]${NC}"
+        echo -e "${WHITE} 3)${NC} Pending Registrations  ${PURPLE}[Review queue]${NC}"
+        echo -e "${WHITE} 4)${NC} Approve Registration   ${PURPLE}[Authorize new users]${NC}"
+        echo -e "${WHITE} 5)${NC} Registration Stats     ${PURPLE}[View metrics]${NC}"
+        echo -e "${WHITE} 6)${NC} API Key Management     ${PURPLE}[Create/revoke keys]${NC}"
+        echo -e "${WHITE} 0)${NC} Back"
+        echo ""
+        echo -ne "${GREEN}security>${NC} "
+        
+        read -r choice
+        case $choice in
+            1) configure_domain_security ;;
+            2) manage_approvers ;;
+            3) list_pending_registrations ;;
+            4) approve_registration ;;
+            5) show_registration_stats ;;
+            6) api_key_menu ;;
+            0) return ;;
+            *) echo -e "${RED}[!] Invalid selection${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+network_menu() {
+    while true; do
+        display_banner
+        echo -e "${CYAN}[NETWORK OPERATIONS]${NC}"
+        echo -e "${WHITE} 1)${NC} Start Yggdrasil        ${PURPLE}[TPM-secured mesh network]${NC}"
+        echo -e "${WHITE} 2)${NC} Stop Yggdrasil         ${PURPLE}[Shutdown mesh network]${NC}"
+        echo -e "${WHITE} 3)${NC} Start API Daemon       ${PURPLE}[Enable REST API]${NC}"
+        echo -e "${WHITE} 4)${NC} Stop API Daemon        ${PURPLE}[Disable REST API]${NC}"
+        echo -e "${WHITE} 5)${NC} Network Status         ${PURPLE}[Show connections]${NC}"
+        echo -e "${WHITE} 6)${NC} Sync with Peers        ${PURPLE}[P2P synchronization]${NC}"
+        echo -e "${WHITE} 0)${NC} Back"
+        echo ""
+        echo -ne "${GREEN}network>${NC} "
+        
+        read -r choice
+        case $choice in
+            1) start_yggdrasil ;;
+            2) stop_yggdrasil ;;
+            3) start_api_daemon ;;
+            4) stop_api_daemon ;;
+            5) show_network_status ;;
+            6) sync_with_peers ;;
+            0) return ;;
+            *) echo -e "${RED}[!] Invalid selection${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+blockchain_menu() {
+    while true; do
+        display_banner
+        echo -e "${CYAN}[BLOCKCHAIN OPERATIONS]${NC}"
+        echo -e "${WHITE} 1)${NC} Publish to Blockchain  ${PURPLE}[Emercoin NVS]${NC}"
+        echo -e "${WHITE} 2)${NC} IPFS Operations        ${PURPLE}[Pin/unpin files]${NC}"
+        echo -e "${WHITE} 3)${NC} Download Database      ${PURPLE}[From remote domain]${NC}"
+        echo -e "${WHITE} 4)${NC} Update Merkle Roots    ${PURPLE}[Rehash database]${NC}"
+        echo -e "${WHITE} 5)${NC} Storage Tiering        ${PURPLE}[CBOR/IPFS/BitTorrent]${NC}"
+        echo -e "${WHITE} 0)${NC} Back"
+        echo ""
+        echo -ne "${GREEN}blockchain>${NC} "
+        
+        read -r choice
+        case $choice in
+            1) 
+                echo -n "Enter domain: "
+                read domain
+                cid=$(publish_database_ipfs)
+                merkle_root=$(sqlite3 "$DB_NAME" "SELECT root FROM db_root WHERE table_name='db_root';")
+                publish_to_emercoin_secure "$domain" "$cid" "$merkle_root" "$(get_yggdrasil_address)"
+                ;;
+            2) ipfs_menu ;;
+            3) 
+                echo -n "Remote domain: "
+                read domain
+                download_remote_database "$domain"
+                ;;
+            4) update_all_merkle_roots ;;
+            5) storage_menu ;;
+            0) return ;;
+            *) echo -e "${RED}[!] Invalid selection${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+admin_menu_enhanced() {
+    while true; do
+        display_banner
+        echo -e "${CYAN}[ADMINISTRATION]${NC}"
+        echo -e "${WHITE} 1)${NC} Initial Setup          ${PURPLE}[One-time configuration]${NC}"
+        echo -e "${WHITE} 2)${NC} Spending Controls      ${PURPLE}[Limits & authorization]${NC}"
+        echo -e "${WHITE} 3)${NC} Transaction Logs       ${PURPLE}[Audit trail]${NC}"
+        echo -e "${WHITE} 4)${NC} Admin Management       ${PURPLE}[Add/remove admins]${NC}"
+        echo -e "${WHITE} 5)${NC} Database Maintenance   ${PURPLE}[Backup/restore]${NC}"
+        echo -e "${WHITE} 6)${NC} System Diagnostics     ${PURPLE}[Health checks]${NC}"
+        echo -e "${WHITE} 0)${NC} Back"
+        echo ""
+        echo -ne "${GREEN}admin>${NC} "
+        
+        read -r choice
+        case $choice in
+            1) init_admin_setup ;;
+            2) spending_controls_menu ;;
+            3) show_transaction_log ;;
+            4) admin_management_menu ;;
+            5) database_menu ;;
+            6) system_diagnostics ;;
+            0) return ;;
+            *) echo -e "${RED}[!] Invalid selection${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+quick_actions_menu() {
+    while true; do
+        display_banner
+        echo -e "${CYAN}[QUICK ACTIONS]${NC}"
+        echo -e "${WHITE} 1)${NC} Quick Setup            ${PURPLE}[Register + Start all]${NC}"
+        echo -e "${WHITE} 2)${NC} Start All Services     ${PURPLE}[Yggdrasil + API]${NC}"
+        echo -e "${WHITE} 3)${NC} Stop All Services      ${PURPLE}[Clean shutdown]${NC}"
+        echo -e "${WHITE} 4)${NC} Health Check           ${PURPLE}[Verify system]${NC}"
+        echo -e "${WHITE} 5)${NC} Emergency Backup       ${PURPLE}[Export critical data]${NC}"
+        echo -e "${WHITE} 0)${NC} Back"
+        echo ""
+        echo -ne "${GREEN}quick>${NC} "
+        
+        read -r choice
+        case $choice in
+            1) quick_setup ;;
+            2) auto_start ;;
+            3) shutdown_services ;;
+            4) health_check ;;
+            5) emergency_backup ;;
+            0) return ;;
+            *) echo -e "${RED}[!] Invalid selection${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# Helper functions
+show_network_status() {
+    echo -e "${YELLOW}[NETWORK STATUS]${NC}"
+    
+    if pgrep yggdrasil >/dev/null; then
+        echo -e "${GREEN}Yggdrasil peers:${NC}"
+        yggdrasilctl getPeers | jq -r '.peers | to_entries[] | "\(.key) - Uptime: \(.value.uptime)s"' 2>/dev/null || echo "No peers"
+    else
+        echo -e "${RED}Yggdrasil not running${NC}"
+    fi
+    
+    echo ""
+    echo "Press Enter to continue..."
+    read
+}
+
+shutdown_services() {
+    echo -e "${YELLOW}[SHUTTING DOWN]${NC}"
+    stop_api_daemon
+    stop_yggdrasil
+    echo -e "${GREEN}[✓] All services stopped${NC}"
+    sleep 1
+}
+
+health_check() {
+    echo -e "${YELLOW}[SYSTEM HEALTH CHECK]${NC}"
+    
+    # Check TPM
+    if tpm2_getcap properties-fixed 2>/dev/null | grep -q TPM; then
+        echo -e " ${GREEN}[✓]${NC} TPM: Available"
+    else
+        echo -e " ${RED}[✗]${NC} TPM: Not available"
+    fi
+    
+    # Check YubiKey
+    if ykman list 2>/dev/null | grep -q "YubiKey"; then
+        echo -e " ${GREEN}[✓]${NC} YubiKey: Detected"
+    else
+        echo -e " ${YELLOW}[!]${NC} YubiKey: Not detected"
+    fi
+    
+    # Check Emercoin
+    if emercoin-cli getinfo >/dev/null 2>&1; then
+        echo -e " ${GREEN}[✓]${NC} Emercoin: Running"
+    else
+        echo -e " ${RED}[✗]${NC} Emercoin: Not running"
+    fi
+    
+    # Check IPFS
+    if ipfs id >/dev/null 2>&1; then
+        echo -e " ${GREEN}[✓]${NC} IPFS: Running"
+    else
+        echo -e " ${YELLOW}[!]${NC} IPFS: Not running"
+    fi
+    
+    echo ""
+    echo "Press Enter to continue..."
+    read
+}
+
+# Start the main menu
+main_menu

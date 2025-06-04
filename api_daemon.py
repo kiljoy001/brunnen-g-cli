@@ -68,6 +68,51 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 
+async def discover_domain():
+    """Discover which domain this node serves based on wallet addresses"""
+    try:
+        # Check local database first
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT domain, owner_address FROM domain_settings WHERE verified_at IS NOT NULL ORDER BY verified_at DESC LIMIT 1"
+            ) as cursor:
+                result = await cursor.fetchone()
+                if result:
+                    return result[0], result[1]
+        
+        # Query blockchain for domains we control
+        proc = await asyncio.create_subprocess_exec(
+            'emercoin-cli', 'listaddressgroupings',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            addresses = json.loads(stdout.decode())
+            
+            # Check each address for domain ownership
+            for group in addresses:
+                for addr_info in group:
+                    address = addr_info[0]
+                    
+                    # Search for dns: names owned by this address
+                    proc = await asyncio.create_subprocess_exec(
+                        'emercoin-cli', 'name_scan', 'dns:', '1000',
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await proc.communicate()
+                    if proc.returncode == 0:
+                        names = json.loads(stdout.decode())
+                        for name_data in names:
+                            if name_data.get('address') == address:
+                                domain = name_data['name'].replace('dns:', '')
+                                return domain, address
+    except Exception as e:
+        logging.error(f"Domain discovery error: {e}")
+    
+    return None, None
+
 class AESCrypto:
     def __init__(self):
         self.key = self._get_or_create_key()
@@ -190,9 +235,15 @@ class DatabaseIntegrity:
                     leaf = f"{row[0]}|{row[1]}|{row[2]}|{row[3]}"
                     leaves.append(leaf)
         
+        if not leaves:
+            return None
+        
         return MerkleTree.calculate_merkle_root(leaves)
     
     async def store_merkle_in_tpm(self, merkle_root):
+        if not merkle_root:
+            logging.warning("No merkle root to store!")
+            return False
         try:
             # Store in TPM NV memory
             proc = await asyncio.create_subprocess_exec(
@@ -250,7 +301,8 @@ class DatabaseIntegrity:
     
     async def update_integrity(self):
         merkle_root = await self.calculate_db_merkle()
-        await self.store_merkle_in_tpm(merkle_root)
+        if merkle_root:
+            await self.store_merkle_in_tpm(merkle_root)
 
 class EconomicDefense:
     def __init__(self, db_path):
@@ -258,7 +310,26 @@ class EconomicDefense:
         self.base_cost = 0.01
         self.base_period = 2  # Base period in days (2 days)
         self.lock = Lock()
-        
+    # Check before allowing registration
+    async def check_domain_policy(self, domain, ygg_pubkey):
+        async with aiosqlite.connect(self.db_path) as db:
+            # Check whitelist
+            async with db.execute(
+                "SELECT 1 FROM domain_whitelists WHERE domain = ? AND ygg_pubkey = ?",
+                (domain, ygg_pubkey)
+            ) as cursor:
+                if await cursor.fetchone():
+                    return True
+
+            # Check domain policy
+            async with db.execute(
+                "SELECT whitelist_mode FROM domain_policies WHERE domain = ?",
+                (domain,)
+            ) as cursor:
+                result = await cursor.fetchone()
+                if result and result[0]:  # whitelist_mode = True
+                    return False  # Not whitelisted
+        return True
     async def get_current_block_height(self):
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -451,6 +522,14 @@ async def setup_database():
                 merkle_root TEXT,
                 verified BOOLEAN
             );
+
+            CREATE TABLE IF NOT EXISTS domain_policies (
+                domain TEXT PRIMARY KEY,
+                allow_public_registration BOOLEAN DEFAULT 1,
+                require_approval BOOLEAN DEFAULT 0,
+                min_first_payment REAL DEFAULT 0.01,
+                whitelist_mode BOOLEAN DEFAULT 0
+            );
         """)
         await db.commit()
 
@@ -545,7 +624,8 @@ async def register_identity(request, economic_defense, crypto, integrity):
         ygg_pubkey = await get_yggdrasil_pubkey()
         if not ygg_pubkey:
             return web.json_response({"status": "error", "message": "Yggdrasil public key required"}, status=400)
-    
+    if not await economic_defense.check_domain_policy(domain, ygg_pubkey):
+        return web.json_response({"status": "error", "message": "Not authorized for this domain"}, status=403)
     required_cost = await economic_defense.calculate_registration_cost(domain, ygg_pubkey)
     
     if required_cost > economic_defense.base_cost:
@@ -632,7 +712,12 @@ async def init_app():
     import aiosqlite
     
     await setup_database()
-    
+    DOMAIN_NAME, owner_address = await discover_domain()
+    if not DOMAIN_NAME:
+        DOMAIN_NAME = os.environ.get('BRUNNEN_DOMAIN', '')
+        if not DOMAIN_NAME:
+            raise Exception("No domain found in wallet or environment!")
+    logging.info(f"Serving domain: {DOMAIN_NAME} (owner: {owner_address})")
     if not await verify_domain_ownership():
         raise Exception("Domain verification failed")
     
@@ -670,12 +755,10 @@ async def init_app():
     return app
 
 def main():
-    APIHandler.setup_database_once()
-    
     print(f"Starting Brunnen-G API daemon on port {API_PORT}")
     print("API Version: 1.0.0")
     print(f"Database: {DB_NAME}")
-    print(f"Logs: {LOG_FILE}")
+    print(f"Domain: {DOMAIN_NAME}")
     print(f"PID: {os.getpid()}")
     
     # Write PID file
@@ -683,13 +766,17 @@ def main():
         f.write(str(os.getpid()))
     
     try:
-        server = HTTPServer(('', API_PORT), APIHandler)
-        server.serve_forever()
+        # Run the async app
+        app = asyncio.run(init_app())
+        web.run_app(app, host='0.0.0.0', port=API_PORT)
     except KeyboardInterrupt:
         print("\nShutting down API daemon")
-        server.shutdown()
     finally:
         cleanup()
 
 if __name__ == '__main__':
+    # For Python 3.7+ compatibility
+    if sys.version_info >= (3, 7):
+        asyncio.run = asyncio.get_event_loop().run_until_complete
+    
     main()
