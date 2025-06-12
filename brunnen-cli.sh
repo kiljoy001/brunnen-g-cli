@@ -91,7 +91,7 @@ init_admin_setup() {
     fi
 
     # Check if TPM master key already exists
-    if tpm2_getcap handles-persistent | grep -q "0x81800000"; then
+    if tpm2_getcap handles-persistent | grep -q "0x81000001"; then
         echo "TPM master key already exists"
     else
         # Create semaphore lock
@@ -104,13 +104,13 @@ init_admin_setup() {
         echo "Generating TPM master key..."
         
         # Clear any existing handle first
-        tpm2_evictcontrol -C o -c 0x81800000 2>/dev/null || true
+        tpm2_evictcontrol -C o -c 0x81000001 2>/dev/null || true
         
         # Create primary key
         tpm2_createprimary -C o -g sha256 -G aes -c /tmp/master.ctx
         
         # Make persistent
-        tpm2_evictcontrol -C o -c /tmp/master.ctx 0x81800000
+        tpm2_evictcontrol -C o -c /tmp/master.ctx 0x81000001
         rm -f /tmp/master.ctx
         
         # Release lock
@@ -136,7 +136,9 @@ init_admin_setup() {
     sqlite3 "$DB_NAME" "INSERT INTO admin_auth 
                        (yubikey_cert_hash, role, created_at, created_by)
                        VALUES ('$admin_cert_hash', 'super_admin', $(date +%s), 'initial_setup');"
-    
+    # In init_admin_setup, after the sqlite3 INSERT:
+    echo "DEBUG: Admin inserted with hash: $admin_cert_hash"
+    sleep 2
     # Set initial spending limits
     configure_spending_limits
     
@@ -186,11 +188,14 @@ init_spending_tables() {
 }
 
 configure_spending_limits() {
+    echo "DEBUG: Entering configure_spending_limits"
+    sleep 2
     echo "=== Configure Spending Limits ==="
     
     # Verify admin YubiKey
     if ! verify_admin_yubikey; then
         echo "Admin authentication required"
+        sleep 3
         return 1
     fi
     
@@ -216,7 +221,7 @@ configure_spending_limits() {
     echo "$limits_json" > /tmp/limits.json
     
     # Generate key material from TPM
-    tpm2_hmac -c 0x81800000 --hex "brunnen-g-spending-limits" -o /tmp/key.bin
+    tpm2_hmac -c 0x81000001 --hex "brunnen-g-spending-limits" -o /tmp/key.bin
     
     # Encrypt with openssl (simplified version)
     openssl enc -aes-256-cbc -salt -in /tmp/limits.json -out /tmp/limits.enc \
@@ -243,6 +248,8 @@ configure_spending_limits() {
 }
 
 verify_admin_yubikey() {
+    echo "DEBUG: Entering verify_admin_yubikey"
+    sleep 2
     echo "Insert admin YubiKey and press Enter..."
     read
     
@@ -956,78 +963,31 @@ generate_yubikey_cert() {
     local address="$1"
     local tpm_handle="$2"
     
-    echo "Generating YubiKey certificate tied to TPM..."
+    # Generate TPM cert using existing script
+    ./tpm/tpm_self_signed_cert.sh
+    local tpm_cert_hash=$(sha256sum ./certs/cert.pem | cut -d' ' -f1)
     
-    # Create unique temp files with proper permissions
-    local temp_id="$$"
-    local tpm_pub_file="/dev/shm/tpm_pub_${temp_id}.pem"
-    local yubikey_pub_file="/dev/shm/yubikey_pub_${temp_id}.pem"
-    local linked_cert_file="/dev/shm/linked_cert_${temp_id}.pem"
-    
-    # Ensure clean state
-    rm -f "$tpm_pub_file" "$yubikey_pub_file" "$linked_cert_file" 2>/dev/null
-    
-    # Export TPM public key with proper permissions
-    if check_tpm_access; then
-        tpm2_readpublic -c "$tpm_handle" -f pem -o "$tpm_pub_file"
-    else
-        sudo tpm2_readpublic -c "$tpm_handle" -f pem -o "$tpm_pub_file"
-        # Fix ownership after sudo operation
-        sudo chown $(whoami):$(id -gn) "$tpm_pub_file"
-    fi
-    chmod 644 "$tpm_pub_file"
-    
-    # Generate YubiKey key with proper file handling
-    touch "$yubikey_pub_file"
-    chmod 666 "$yubikey_pub_file"
-    
-    if ! ykman piv keys generate 9a "$yubikey_pub_file" 2>/dev/null; then
-        echo "Retrying YubiKey key generation..."
-        # Sometimes YubiKey needs a reset
-        ykman piv reset 2>/dev/null || true
-        sleep 1
-        ykman piv keys generate 9a "$yubikey_pub_file"
+    # Check if YubiKey cert exists, generate if not
+    if ! ykman piv certificates export 9a - >/dev/null 2>&1; then
+        echo "Generating YubiKey certificate..."
+        echo -n "Enter YubiKey PIN: "
+        read -s pin
+        echo
+        ykman piv keys generate 9a - 2>/dev/null || true
+        echo "$pin" | ykman piv certificates generate -s "/CN=$address" 9a - --pin -
     fi
     
-    # Ensure file is readable
-    chmod 644 "$yubikey_pub_file"
+    # Hash YubiKey cert
+    local yk_cert_hash=$(ykman piv certificates export 9a - | sha256sum | cut -d' ' -f1)
     
-    # Generate self-signed certificate using the YubiKey public key
-    # Since we can't use TPM private key directly, we create a cert request instead
-    openssl req -new -x509 -days 365 \
-        -key <(ykman piv keys export 9a) \
-        -out "$linked_cert_file" \
-        -subj "/CN=$address/O=Brunnen-G/OU=TPM-YubiKey" 2>/dev/null || \
-    # Fallback: create a simple self-signed cert
-    openssl req -new -x509 -days 365 \
-        -nodes -keyout /dev/shm/temp_key_${temp_id}.pem \
-        -out "$linked_cert_file" \
-        -subj "/CN=$address/O=Brunnen-G/OU=TPM-YubiKey"
+    # Composite hash
+    local admin_hash=$(echo -n "${tpm_cert_hash}${yk_cert_hash}" | sha256sum | cut -d' ' -f1)
     
-    # Import certificate to YubiKey
-    if [[ -f "$linked_cert_file" ]]; then
-        ykman piv certificates import 9a "$linked_cert_file"
-        
-        # Calculate combined hash
-        if [[ -f "$tpm_pub_file" ]] && [[ -f "$yubikey_pub_file" ]]; then
-            combined_hash=$(cat "$tpm_pub_file" "$yubikey_pub_file" | sha256sum | cut -d' ' -f1)
-            echo "YubiKey cert installed. Combined hash: $combined_hash"
-            
-            # Update database
-            sqlite3 "$DB_NAME" "UPDATE address_keys SET yubikey_hash = '$combined_hash' WHERE address = '$address';"
-        else
-            echo "Warning: Could not calculate combined hash"
-        fi
-    else
-        echo "Error: Failed to generate certificate"
-        return 1
-    fi
+    # Store as admin key
+    sqlite3 "$DB_NAME" "INSERT OR REPLACE INTO admin_auth (yubikey_cert_hash, role, created_at) 
+                       VALUES ('$admin_hash', 'admin', $(date +%s));"
     
-    # Cleanup
-    shred -u "$tpm_pub_file" "$yubikey_pub_file" "$linked_cert_file" "/dev/shm/temp_key_${temp_id}.pem" 2>/dev/null || \
-    rm -f "$tpm_pub_file" "$yubikey_pub_file" "$linked_cert_file" "/dev/shm/temp_key_${temp_id}.pem" 2>/dev/null
-    
-    return 0
+    echo "Admin key: ${admin_hash:0:16}..."
 }
 
 verify_yubikey_identity() {

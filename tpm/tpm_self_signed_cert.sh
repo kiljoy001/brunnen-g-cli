@@ -6,9 +6,9 @@ set -e
 KEY_ALG="RSA"               # Algorithm (RSA/EC)
 KEY_SIZE=2048               # Key size for RSA (2048/3072/4096)
 CERT_DAYS=365               # Certificate validity in days
-OUT_DIR="./certs"           # Output directory
-KEY_FILE="$OUT_DIR/tpm.key" # Private key file
-CERT_FILE="$OUT_DIR/cert.pem" # Certificate file
+OUT_DIR="/dev/shm"           # Output directory
+KEY_FILE="$OUT_DIR/tpm_$$.key" # Private key file
+CERT_FILE="$OUT_DIR/tpm_cert_$$.pem" # Certificate file
 SUBJECT="/CN=TPM-Self-Signed" # Certificate subject
 
 # Check dependencies
